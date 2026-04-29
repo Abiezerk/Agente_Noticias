@@ -1,70 +1,98 @@
+import os
 import requests
 from bs4 import BeautifulSoup
-import os
-from datetime import datetime
 import pytz
+from datetime import datetime
 
-def obtener_calendario_real():
-    # Usamos un Proxy para evitar que GitHub sea bloqueado
-    # Puedes usar ScraperAPI (5000 peticiones gratis al mes)
-    SCRAPER_API_KEY = os.getenv('SCRAPER_API_KEY') 
+# --- CONFIGURACIÓN DE ZONA HORARIA ---
+TIJUANA_TZ = pytz.timezone('America/Tijuana')
+
+def obtener_calendario_alto_impacto():
+    """Extrae eventos de 3 estrellas de Investing usando bypass de Proxy."""
+    api_key = os.getenv('SCRAPER_API_KEY')
     target_url = "https://www.investing.com/economic-calendar/"
+    # El parámetro render=true es vital para saltar protecciones de JavaScript
+    proxy_url = f"http://api.scraperapi.com?api_key={api_key}&url={target_url}&render=true"
     
-    # Si no tienes la key de ScraperAPI aún, el código intentará conexión directa con headers limpios
-    if SCRAPER_API_KEY:
-        url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={target_url}"
-    else:
-        url = target_url
-
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-    
-    eventos_finales = []
+    eventos = []
     try:
-        response = requests.get(url, headers=headers, timeout=30)
+        # Timeout extendido a 120s porque el renderizado de Chrome remoto es lento
+        response = requests.get(proxy_url, timeout=120)
         if response.status_code != 200:
-            return [f"⚠️ Bloqueo detectado (Status {response.status_code}). Necesitas SCRAPER_API_KEY."]
-            
+            return [f"⚠️ Error de Proxy: Status {response.status_code}. Revisa SCRAPER_API_KEY."]
+
         soup = BeautifulSoup(response.content, 'html.parser')
-        tabla = soup.find('table', {'id': 'economicCalendarData'})
-        filas = tabla.find_all('tr', {'class': 'js-event-item'})
-        
+        filas = soup.select('tr.js-event-item')
+
         for fila in filas:
-            # Detectamos las estrellas de impacto
-            impacto_td = fila.find('td', {'class': 'sentiment'})
-            estrellas = impacto_td.find_all('i', {'class': 'grayFullBullishIcon'})
-            
-            if len(estrellas) >= 3: # Solo Alta Volatilidad
-                hora = fila.find('td', {'class': 'time'}).text.strip()
-                pais = fila.find('td', {'class': 'flagCur'}).text.strip()
-                evento = fila.find('td', {'class': 'event'}).text.strip()
-                eventos_finales.append(f"🔴 **{hora}** | {pais}: {evento}")
-
+            # Filtro de impacto (3 estrellas/toros)
+            impacto = fila.select('td.sentiment i.grayFullBullishIcon')
+            if len(impacto) >= 3:
+                hora = fila.select_one('td.time').text.strip()
+                pais = fila.select_one('td.flagCur').text.strip()
+                nombre = fila.select_one('td.event').text.strip()
+                eventos.append(f"🔴 **{hora}** | {pais}: {nombre}")
     except Exception as e:
-        return [f"❌ Error de conexión: {str(e)}"]
+        return [f"❌ Fallo en conexión de calendario: {str(e)}"]
 
-    return eventos_finales[:8] if eventos_finales else ["🔹 Sin noticias de alto impacto hoy."]
+    return eventos[:8] if eventos else ["🔹 No se detectaron eventos críticos para hoy."]
 
-def enviar_reporte():
+def obtener_noticias_geopoliticas():
+    """Obtiene noticias reales de guerra y macroeconomía vía NewsAPI."""
+    api_key = os.getenv('NEWS_API_KEY')
+    # Query optimizada para tus pares operativos (Oro, Crudo, USD)
+    query = '(war OR conflict OR fed OR fomc OR "interest rates") AND (finance OR economy)'
+    url = f'https://newsapi.org/v2/everything?q={query}&sortBy=publishedAt&language=es&apiKey={api_key}'
+    
+    titulares = []
+    try:
+        res = requests.get(url, timeout=30).json()
+        articulos = res.get('articles', [])
+        
+        for art in articulos[:5]:
+            titulo = art.get('title', 'Sin título')
+            # Categorización visual
+            prefix = "⚔️" if any(w in titulo.lower() for w in ['guerra', 'conflicto', 'misil', 'ataque']) else "🏛️"
+            titulares.append(f"{prefix} {titulo}")
+    except:
+        titulares = ["⚠️ No se pudo sincronizar el radar de noticias."]
+        
+    return titulares if titulares else ["🔹 Panorama geopolítico en calma aparente."]
+
+def ejecutar_agente():
+    """Orquesta la recolección y el envío del reporte a Discord."""
     webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
-    tz = pytz.timezone('America/Tijuana')
-    fecha_hoy = datetime.now(tz).strftime('%d/%m/%Y %H:%M')
+    ahora = datetime.now(TIJUANA_TZ).strftime('%d/%m/%Y %H:%M')
     
-    eventos = obtener_calendario_real()
+    # 1. Recolección de Capas
+    noticias = obtener_noticias_geopoliticas()
+    calendario = obtener_calendario_alto_impacto()
     
+    # 2. Análisis de Sesgo (Capa 3)
+    noticias_str = " ".join(noticias).lower()
+    if "⚔️" in noticias_str:
+        sesgo, color = "⚠️ RISK-OFF / GUERRA", 0x990000 # Rojo Guerra
+    elif "fed" in noticias_str or "rate" in noticias_str:
+        sesgo, color = "⚖️ VOLATILIDAD MACRO", 0x0055ff # Azul FED
+    else:
+        sesgo, color = "NEUTRAL / TÉCNICO", 0x2b2d31 # Gris Estándar
+
+    # 3. Construcción del Mensaje
     payload = {
+        "content": "@everyone 🛰️ **Sentinel v12.0: Reporte Automatizado**",
         "embeds": [{
-            "title": f"🛰️ RADAR MACRO RECURRENTE | {fecha_hoy}",
-            "color": 0x00ff00 if "🔴" in str(eventos) else 0x2b2d31,
+            "title": f"🛡️ INTELIGENCIA DE MERCADO | {ahora}",
+            "color": color,
             "fields": [
-                {"name": "📅 Calendario de Alta Volatilidad", "value": "\n".join(eventos), "inline": False},
-                {"name": "⚙️ Estado del Sistema", "value": "Extracción dinámica vía Proxy.", "inline": True}
+                {"name": "🌍 CAPA 1: Marea Geopolítica (Noticias Reales)", "value": "\n".join(noticias), "inline": False},
+                {"name": "📅 CAPA 2: Calendario de Alto Impacto (Live)", "value": "\n".join(calendario), "inline": False},
+                {"name": "🎯 CAPA 3: Sesgo del Agente", "value": f"**{sesgo}**\nActualizado dinámicamente según flujo de datos.", "inline": False}
             ],
-            "footer": {"text": "Tijuana Local Time | Agente v11.0"}
+            "footer": {"text": "Local Time Tijuana | Auditoría de Grado Industrial"}
         }]
     }
+    
     requests.post(webhook_url, json=payload)
 
 if __name__ == "__main__":
-    enviar_reporte()
+    ejecutar_agente()
