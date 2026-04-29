@@ -1,10 +1,14 @@
-name: Sentinel v2.0 — Agente de Inteligencia Financiera
+name: Sentinel v2.1 — Agente de Inteligencia Financiera
 
 on:
   schedule:
     # Lunes a viernes a las 13:00 UTC = 06:00 AM Tijuana (PDT)
     - cron: '0 13 * * 1-5'
-  workflow_dispatch: # Ejecución manual para pruebas
+  workflow_dispatch:
+
+env:
+  # Fix warning Node.js 20: fuerza Node.js 24 en todas las actions del job
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   ejecutar-agente:
@@ -24,10 +28,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ejecutar Sentinel v2.0
+      - name: Ejecutar Sentinel v2.1
         env:
-          # ⚠️ Asegúrate de tener estas 3 variables en Settings > Secrets > Actions
+          # ⚠️ Asegúrate de tener estas 4 variables en Settings > Secrets > Actions
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           NEWS_API_KEY:        ${{ secrets.NEWS_API_KEY }}
           FINNHUB_API_KEY:     ${{ secrets.FINNHUB_API_KEY }}
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
         run: python agente_inteligente.py
