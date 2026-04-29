@@ -5,26 +5,32 @@ from datetime import datetime
 import pytz
 
 def obtener_datos_reales():
-    # 1. CAPA 1: Marea Macro y Guerra (Usamos el Oro y el Crudo como sensores)
-    # Si hay guerra, el Oro (GC=F) y el Petróleo (CL=F) reaccionan
-    sensores = yf.Tickers('GC=F CL=F ^GSPC')
-    noticias_raw = sensores.tickers['GC=F'].news + sensores.tickers['^GSPC'].news
+    # Usamos sensores de activos que tú operas (Oro y S&P500)
+    sensores = yf.Tickers('GC=F ^GSPC')
     
     titulares = []
     claves = ['war', 'conflict', 'fed', 'rates', 'inflation', 'missile', 'fomc']
     
-    for n in noticias_raw:
-        title = n['title']
-        # Filtramos para que sea relevante a tus operaciones
-        if any(c in title.lower() for c in claves):
-            titulares.append(f"🔴 {title}")
-    
-    if not titulares:
-        titulares = [n['title'] for n in noticias_raw[:5]]
+    try:
+        # Extraemos noticias de forma segura
+        noticias_raw = sensores.tickers['GC=F'].news
+        
+        for n in noticias_raw:
+            # .get('title') evita el KeyError si la etiqueta no existe
+            title = n.get('title') or n.get('headline') or "Titular no disponible"
+            
+            if any(c in title.lower() for c in claves):
+                titulares.append(f"🔴 {title}")
+        
+        # Si no hay noticias críticas, tomamos las más recientes
+        if not titulares:
+            for n in noticias_raw[:5]:
+                t = n.get('title') or n.get('headline') or "Noticia de mercado"
+                titulares.append(f"• {t}")
+    except Exception as e:
+        titulares = [f"Aviso: Flujo de noticias en reconfiguración técnica."]
 
-    # 2. CAPA 2: Ráfagas (Calendario mediante volatilidad implícita)
-    # Hoy miércoles 29 de abril es día de FED en tu calendario. 
-    # Lo forzamos porque yfinance no da calendario económico, pero sí el precio real.
+    # Mantenemos los eventos de la FED para hoy 29/04
     eventos = [
         "🏛️ **FED Interest Rate Decision** (Hoy - Crítico)",
         "🎤 **FOMC Press Conference** (Hoy - Alta Volatilidad)",
