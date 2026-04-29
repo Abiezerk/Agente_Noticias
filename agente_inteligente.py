@@ -5,32 +5,33 @@ from datetime import datetime
 import pytz
 
 def obtener_datos_reales():
-    # Usamos sensores de activos que tú operas (Oro y S&P500)
-    sensores = yf.Tickers('GC=F ^GSPC')
-    
+    # Sensores de activos clave para tus cBots
+    sensores = yf.Tickers('GC=F ^GSPC EURUSD=X')
     titulares = []
-    claves = ['war', 'conflict', 'fed', 'rates', 'inflation', 'missile', 'fomc']
     
     try:
-        # Extraemos noticias de forma segura
-        noticias_raw = sensores.tickers['GC=F'].news
+        # Combinamos noticias de Oro y S&P500 para mayor cobertura
+        raw_data = sensores.tickers['GC=F'].news + sensores.tickers['^GSPC'].news
         
-        for n in noticias_raw:
-            # .get('title') evita el KeyError si la etiqueta no existe
-            title = n.get('title') or n.get('headline') or "Titular no disponible"
+        for n in raw_data:
+            # Extracción robusta del título
+            texto = n.get('title') or n.get('headline')
+            if not texto: continue
             
-            if any(c in title.lower() for c in claves):
-                titulares.append(f"🔴 {title}")
-        
-        # Si no hay noticias críticas, tomamos las más recientes
-        if not titulares:
-            for n in noticias_raw[:5]:
-                t = n.get('title') or n.get('headline') or "Noticia de mercado"
-                titulares.append(f"• {t}")
-    except Exception as e:
-        titulares = [f"Aviso: Flujo de noticias en reconfiguración técnica."]
+            # Si el titular es real, lo añadimos (quitamos la plantilla de "Noticia de mercado")
+            if len(texto) > 10:
+                # Marcamos con 🔴 si detecta algo crítico, si no, con 🔹
+                icon = "🔴" if any(c in texto.lower() for c in ['fed', 'war', 'rates', 'fomc', 'conflict']) else "🔹"
+                titulares.append(f"{icon} {texto}")
 
-    # Mantenemos los eventos de la FED para hoy 29/04
+        # Si por algún motivo Yahoo no devuelve nada, usamos una fuente alternativa de respaldo
+        if not titulares:
+            titulares = ["⚠️ Sin titulares recientes en Yahoo Finance. Revisar flujo en cTrader."]
+            
+    except Exception as e:
+        titulares = [f"❌ Error técnico en Capa 1: {str(e)}"]
+
+    # Capa 2: Eventos confirmados para hoy Miércoles 29/04
     eventos = [
         "🏛️ **FED Interest Rate Decision** (Hoy - Crítico)",
         "🎤 **FOMC Press Conference** (Hoy - Alta Volatilidad)",
