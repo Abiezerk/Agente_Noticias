@@ -8,34 +8,45 @@ from datetime import datetime
 TIJUANA_TZ = pytz.timezone('America/Tijuana')
 
 def obtener_calendario_alto_impacto():
-    """Extrae eventos de 3 estrellas de Investing usando bypass de Proxy."""
+    """Extrae eventos con autenticación reforzada para evitar Error 401."""
     api_key = os.getenv('SCRAPER_API_KEY')
     target_url = "https://www.investing.com/economic-calendar/"
-    # El parámetro render=true es vital para saltar protecciones de JavaScript
-    proxy_url = f"http://api.scraperapi.com?api_key={api_key}&url={target_url}&render=true"
+    
+    # Intentamos la estructura de parámetros alternativa
+    params = {
+        'api_key': api_key,
+        'url': target_url,
+        'render': 'true',
+        'country_code': 'us' # Forzamos IP de EE.UU. para mejor compatibilidad
+    }
     
     eventos = []
     try:
-        # Timeout extendido a 120s porque el renderizado de Chrome remoto es lento
-        response = requests.get(proxy_url, timeout=120)
+        # Usamos params en lugar de f-string para asegurar el encoding correcto
+        response = requests.get("http://api.scraperapi.com", params=params, timeout=120)
+        
+        if response.status_code == 401:
+            return ["❌ Error 401: La API Key de ScraperAPI es inválida o no existe en GitHub Secrets."]
+        
         if response.status_code != 200:
-            return [f"⚠️ Error de Proxy: Status {response.status_code}. Revisa SCRAPER_API_KEY."]
+            return [f"⚠️ Error {response.status_code}: El proxy no pudo acceder a Investing."]
 
         soup = BeautifulSoup(response.content, 'html.parser')
-        filas = soup.select('tr.js-event-item')
+        # Buscamos la tabla con un selector más genérico por si cambió el DOM
+        filas = soup.find_all('tr', class_=lambda x: x and 'event-item' in x)
 
         for fila in filas:
-            # Filtro de impacto (3 estrellas/toros)
             impacto = fila.select('td.sentiment i.grayFullBullishIcon')
             if len(impacto) >= 3:
-                hora = fila.select_one('td.time').text.strip()
-                pais = fila.select_one('td.flagCur').text.strip()
-                nombre = fila.select_one('td.event').text.strip()
-                eventos.append(f"🔴 **{hora}** | {pais}: {nombre}")
+                hora = fila.select_one('td.time').get_text(strip=True)
+                evento = fila.select_one('td.event').get_text(strip=True)
+                pais = fila.select_one('td.flagCur').get_text(strip=True)
+                eventos.append(f"🔴 **{hora}** | {pais}: {evento}")
+                
     except Exception as e:
-        return [f"❌ Fallo en conexión de calendario: {str(e)}"]
+        return [f"❌ Fallo técnico: {str(e)}"]
 
-    return eventos[:8] if eventos else ["🔹 No se detectaron eventos críticos para hoy."]
+    return eventos[:8] if eventos else ["🔹 No hay noticias de alto impacto en este ciclo."]
 
 def obtener_noticias_geopoliticas():
     """Obtiene noticias reales de guerra y macroeconomía vía NewsAPI."""
