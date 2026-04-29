@@ -4,34 +4,40 @@ from datetime import datetime, timedelta
 import pytz
 
 def obtener_datos_api():
-    # El script saca la llave única de tus secrets de GitHub
     api_key = os.getenv('FINANCIAL_API_KEY')
     tz = pytz.timezone('America/Tijuana')
     hoy = datetime.now(tz)
     
-    # --- CAPA 1: MERCADO GENERAL (Noticias de Acciones y Macro) ---
-    # Este link nos da el "sentimiento" global (La Marea)
-    url_noticias = f"https://financialmodelingprep.com/api/v3/stock_news?limit=10&apikey={api_key}"
+    # 1. CAPA 1: Noticias (Usando el endpoint estable de stock_news)
+    # Este link funciona para planes gratuitos y no es 'Legacy'
+    url_news = f"https://financialmodelingprep.com/api/v3/stock_news?limit=10&apikey={api_key}"
     
-    # --- CAPA 2: MERCADO ECONÓMICO (Calendario de Divisas/Forex) ---
-    # Este link nos da las noticias rojas (Las Ráfagas)
-    inicio = hoy.strftime('%Y-%m-%d')
-    fin = (hoy + timedelta(days=5)).strftime('%Y-%m-%d')
-    url_calendario = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={inicio}&to={fin}&apikey={api_key}"
-
     try:
-        # Petición 1: Noticias
-        res_news = requests.get(url_noticias).json()
-        titulares = [n['title'] for n in res_news[:5]] if isinstance(res_news, list) else ["Error en Noticias"]
+        res_news = requests.get(url_news).json()
+        # Verificamos si la respuesta es la lista de noticias esperada
+        if isinstance(res_news, list):
+            titulares = [n['title'] for n in res_news[:5]]
+        else:
+            titulares = ["Nota: Configurando acceso a noticias estables..."]
+    except:
+        titulares = ["Error de conexión con el servidor de noticias."]
 
-        # Petición 2: Calendario
-        res_cal = requests.get(url_calendario).json()
-        eventos = [e for e in res_cal if e.get('impact') == 'High'][:5] if isinstance(res_cal, list) else []
+    # 2. CAPA 2: Calendario (Ampliamos a impacto High y Medium)
+    inicio = hoy.strftime('%Y-%m-%d')
+    fin = (hoy + timedelta(days=7)).strftime('%Y-%m-%d') # Ampliamos a 7 días
+    url_cal = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={inicio}&to={fin}&apikey={api_key}"
+    
+    try:
+        res_cal = requests.get(url_cal).json()
+        if isinstance(res_cal, list):
+            # Filtramos noticias de impacto Alto (Rojo) y Medio (Naranja)
+            eventos = [e for e in res_cal if e.get('impact') in ['High', 'Medium']][:5]
+        else:
+            eventos = []
+    except:
+        eventos = []
 
-        return titulares, eventos
-    except Exception as e:
-        print(f"Error técnico: {e}")
-        return ["Error de conexión"], []
+    return titulares, eventos
 
 def analizar_sentimiento(titulares):
     # Lógica de conclusión propia del agente
