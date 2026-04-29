@@ -4,27 +4,34 @@ from datetime import datetime, timedelta
 import pytz
 
 def obtener_datos_api():
+    # El script saca la llave única de tus secrets de GitHub
     api_key = os.getenv('FINANCIAL_API_KEY')
     tz = pytz.timezone('America/Tijuana')
     hoy = datetime.now(tz)
     
-    # 1. CAPA 1: Noticias Macro (Sentiment)
-    url_news = f"https://financialmodelingprep.com/api/v3/fmp_articles?page=0&apikey={api_key}"
-    noticias_raw = requests.get(url_news).json()
-    titulares = [n['title'] for n in noticias_raw[:5]] # Tomamos los 5 más recientes
+    # --- CAPA 1: MERCADO GENERAL (Noticias de Acciones y Macro) ---
+    # Este link nos da el "sentimiento" global (La Marea)
+    url_noticias = f"https://financialmodelingprep.com/api/v3/stock_news?limit=10&apikey={api_key}"
     
-    # 2. CAPA 2: Calendario Dinámico
-    # Si es domingo, vemos la semana que viene. Si es entre semana, lo que falta.
-    inicio = hoy if hoy.weekday() < 5 else hoy + timedelta(days=1)
-    fin = inicio + timedelta(days=5)
-    
-    url_cal = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={inicio.strftime('%Y-%m-%d')}&to={fin.strftime('%Y-%m-%d')}&apikey={api_key}"
-    calendario_raw = requests.get(url_cal).json()
-    
-    # Filtrar solo eventos de alto impacto (High)
-    eventos = [e for e in calendario_raw if e.get('impact') == 'High'][:5]
-    
-    return titulares, eventos
+    # --- CAPA 2: MERCADO ECONÓMICO (Calendario de Divisas/Forex) ---
+    # Este link nos da las noticias rojas (Las Ráfagas)
+    inicio = hoy.strftime('%Y-%m-%d')
+    fin = (hoy + timedelta(days=5)).strftime('%Y-%m-%d')
+    url_calendario = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={inicio}&to={fin}&apikey={api_key}"
+
+    try:
+        # Petición 1: Noticias
+        res_news = requests.get(url_noticias).json()
+        titulares = [n['title'] for n in res_news[:5]] if isinstance(res_news, list) else ["Error en Noticias"]
+
+        # Petición 2: Calendario
+        res_cal = requests.get(url_calendario).json()
+        eventos = [e for e in res_cal if e.get('impact') == 'High'][:5] if isinstance(res_cal, list) else []
+
+        return titulares, eventos
+    except Exception as e:
+        print(f"Error técnico: {e}")
+        return ["Error de conexión"], []
 
 def analizar_sentimiento(titulares):
     # Lógica de conclusión propia del agente
@@ -57,9 +64,9 @@ def enviar_reporte():
             "title": f"🏛️ REPORTE ESTRATÉGICO | {fecha_reporte}",
             "color": 0x000000,
             "fields": [
-                {"name": "🌊 CAPA 1: Marea Macro (Noticias Reales)", "value": texto_macro if titulares else "Sin noticias relevantes.", "inline": False},
-                {"name": "⚡ CAPA 2: Ráfagas (Calendario de Alto Impacto)", "value": texto_cal if texto_cal else "Sin eventos rojos detectados.", "inline": False},
-                {"name": f"🎯 CAPA 3: La Vela (Sesgo: {sesgo})", "value": f"**Conclusión:** {conclusion}", "inline": False}
+                {"name": "🌊 CAPA 1: Marea Macro", "value": texto_macro if titulares else "Sin noticias relevantes.", "inline": False},
+                {"name": "⚡ CAPA 2: Calendario de Alto Impacto", "value": texto_cal if texto_cal else "Sin eventos rojos detectados.", "inline": False},
+                {"name": f"🎯 CAPA 3: Sesgo - {sesgo}", "value": f"**Conclusión:** {conclusion}", "inline": False}
             ],
             "footer": {"text": "Datos provistos por Financial Modeling Prep API"}
         }]
