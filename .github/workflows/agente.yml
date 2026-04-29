@@ -1,4 +1,14 @@
-steps:
+name: Agente de Inteligencia Financiera
+
+on:
+  schedule:
+    - cron: '0 13 * * 1-5' # Se ejecuta a las 6:00 AM de Tijuana, Lun-Vie
+  workflow_dispatch: # Permite ejecutarlo manualmente para pruebas
+
+jobs:
+  investigar:
+    runs-on: ubuntu-latest
+    steps:
       - name: Checkout del código
         uses: actions/checkout@v4
 
@@ -7,12 +17,16 @@ steps:
         with:
           python-version: '3.9'
 
+      # ESTE ES EL PASO CLAVE QUE FALTABA
       - name: Instalar Dependencias
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install yfinance requests pytz # Instalación forzada por seguridad
 
-      - name: Ejecutar Agente
+      - name: Ejecutar Tarea Semanal
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Ya no necesitas FINANCIAL_API_KEY para yfinance, 
+          # pero déjala si planeas volver a FMP después.
         run: python agente_inteligente.py
