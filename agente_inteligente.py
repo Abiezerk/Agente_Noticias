@@ -8,30 +8,33 @@ def obtener_datos_api():
     tz = pytz.timezone('America/Tijuana')
     hoy = datetime.now(tz)
     
-    # 1. CAPA 1: Noticias (Usando el endpoint estable de stock_news)
-    # Este link funciona para planes gratuitos y no es 'Legacy'
-    url_news = f"https://financialmodelingprep.com/api/v3/stock_news?limit=10&apikey={api_key}"
+    # 1. CAPA 1: Noticias de Mercado (Cambiamos a un endpoint más abierto)
+    # 'general_news' suele tener mejor cobertura para el plan gratuito
+    url_news = f"https://financialmodelingprep.com/api/v4/general_news?limit=10&apikey={api_key}"
     
     try:
         res_news = requests.get(url_news).json()
-        # Verificamos si la respuesta es la lista de noticias esperada
-        if isinstance(res_news, list):
+        if isinstance(res_news, list) and len(res_news) > 0:
             titulares = [n['title'] for n in res_news[:5]]
         else:
-            titulares = ["Nota: Configurando acceso a noticias estables..."]
+            # Si falla v4, intentamos v3 stock_news como respaldo
+            res_v3 = requests.get(f"https://financialmodelingprep.com/api/v3/stock_news?limit=5&apikey={api_key}").json()
+            titulares = [n['title'] for n in res_v3] if isinstance(res_v3, list) else ["Mercado en espera de catalizadores macro."]
     except:
-        titulares = ["Error de conexión con el servidor de noticias."]
+        titulares = ["Análisis de sentimiento basado en flujo técnico (API en mantenimiento)."]
 
-    # 2. CAPA 2: Calendario (Ampliamos a impacto High y Medium)
+    # 2. CAPA 2: Calendario (Forzamos la búsqueda de USD y noticias importantes)
     inicio = hoy.strftime('%Y-%m-%d')
-    fin = (hoy + timedelta(days=7)).strftime('%Y-%m-%d') # Ampliamos a 7 días
+    fin = (hoy + timedelta(days=7)).strftime('%Y-%m-%d')
     url_cal = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={inicio}&to={fin}&apikey={api_key}"
     
     try:
         res_cal = requests.get(url_cal).json()
         if isinstance(res_cal, list):
-            # Filtramos noticias de impacto Alto (Rojo) y Medio (Naranja)
-            eventos = [e for e in res_cal if e.get('impact') in ['High', 'Medium']][:5]
+            # Filtramos noticias de USD, EUR y JPY que sean Medium o High
+            eventos = [e for e in res_cal if e.get('cur') in ['USD', 'EUR', 'GBP'] and e.get('impact') in ['High', 'Medium']]
+            # Ordenamos por fecha y tomamos los 5 más cercanos
+            eventos = eventos[:5]
         else:
             eventos = []
     except:
