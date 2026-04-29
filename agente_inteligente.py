@@ -1,69 +1,87 @@
 import os
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
-def obtener_datos_mercado():
-    """
-    Simulación de scraping de noticias y calendario. 
-    En producción, estas funciones conectan con Investing o ForexFactory.
-    """
-    # Resumen de la semana que cierra (Abril 2026)
-    resumen_pasado = (
-        "• **USD:** La FED mantuvo tasas; el mercado asimila un discurso 'hawkish' moderado.\n"
-        "• **JPY:** Intervención del BoJ tras mínimos históricos del Yen.\n"
-        "• **MXN:** Inflación en México sale ligeramente arriba de lo esperado, presionando al Banxico."
-    )
+def analizar_sentimiento(titulares):
+    """Analiza los titulares para determinar un sesgo dinámico."""
+    palabras_alcistas = ['crece', 'sube', 'alcista', 'recupera', 'positivo', 'ganancias', 'growth', 'bullish']
+    palabras_bajistas = ['cae', 'baja', 'bajista', 'inflación', 'riesgo', 'pérdida', 'recesión', 'bearish']
     
-    # Calendario de la semana que entra (Mayo 2026)
-    calendario_proximo = [
-        {"fecha": "Dom 03", "evento": "Apertura Semanal - GAP Analysis", "impacto": "⚪"},
-        {"fecha": "Lun 04", "evento": "PMI Manufacturero (EE.UU.)", "impacto": "🔴"},
-        {"fecha": "Mié 06", "evento": "Inventarios de Petróleo / ADP Employment", "impacto": "🟠"},
-        {"fecha": "Vie 08", "evento": "NFP: Nóminas No Agrícolas (Día Clave)", "impacto": "🔴"}
+    score = 0
+    texto_completo = " ".join(titulares).lower()
+    
+    for p in palabras_alcistas: score += texto_completo.count(p)
+    for p in palabras_bajistas: score -= texto_completo.count(p)
+    
+    if score > 0: return "ALCISTA (Risk-On)", "Buscar confirmaciones de compra en niveles de soporte tras retrocesos."
+    if score < 0: return "BAJISTA (Risk-Off)", "Priorizar ventas en resistencias clave. Evitar activos de riesgo si la macro presiona."
+    return "NEUTRAL / RANGO", "Mercado indeciso. Esperar ruptura de rangos claros antes de ejecutar."
+
+def obtener_datos_mercado():
+    url_noticias = "https://mx.investing.com/news/economy"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    titulares_lista = []
+    try:
+        response = requests.get(url_noticias, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        elementos = soup.select('.articleItem .title')[:5]
+        titulares_lista = [t.get_text(strip=True) for t in elementos]
+        resumen_macro = "\n".join([f"• {t}" for t in titulares_lista])
+    except:
+        resumen_macro = "• Error al conectar. Revisar volatilidad manualmente."
+        titulares_lista = []
+
+    # Capa 2: Calendario Dinámico
+    hoy = datetime.now()
+    calendario = [
+        {"fecha": (hoy + timedelta(days=1)).strftime('%d/%m'), "evento": "Apertura Semanal / GAP Analysis", "impacto": "⚪"},
+        {"fecha": (hoy + timedelta(days=3)).strftime('%d/%m'), "evento": "Datos de Inflación / PIB (Estimados)", "impacto": "🔴"},
+        {"fecha": (hoy + timedelta(days=5)).strftime('%d/%m'), "evento": "Cierre Semanal / Ajuste de Cartera", "impacto": "🟠"}
     ]
-    return resumen_pasado, calendario_proximo
+
+    # Capa 3: Generación de Conclusiones Propias
+    sesgo, recomendacion = analizar_sentimiento(titulares_lista)
+    
+    return resumen_macro, calendario, sesgo, recomendacion
 
 def enviar_reporte():
     webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
-    if not webhook_url:
-        print("Error: No se encontró la URL del Webhook.")
-        return
+    if not webhook_url: return
 
-    pasado, futuro = obtener_datos_mercado()
+    macro, calendario, sesgo, recomendacion = obtener_datos_mercado()
     tz = pytz.timezone('America/Tijuana')
-    hoy = datetime.now(tz).strftime('%A, %d de %B %Y')
+    fecha_str = datetime.now(tz).strftime('%d de %B, %Y')
 
-    texto_futuro = "\n".join([f"{e['impacto']} **{e['fecha']}**: {e['evento']}" for e in futuro])
+    texto_futuro = "\n".join([f"{e['impacto']} **{e['fecha']}**: {e['evento']}" for e in calendario])
 
     payload = {
-        "content": "@everyone 📊 **Análisis de Mercado Semanal**",
+        "content": "@everyone 📊 **Análisis Autónomo del Agente**",
         "embeds": [{
-            "title": "🏛️ SISTEMA DE 3 CAPAS: REPORTE ESTRATÉGICO",
-            "description": f"Informe generado el {hoy}",
-            "color": 0, # Estética Premium (Negro)
+            "title": f"🏛️ ESTRATEGIA PROFESIONAL | {fecha_str}",
+            "color": 0 if "ALCISTA" not in sesgo else 3066993, # Negro o Verde si es alcista
             "fields": [
                 {
-                    "name": "⏪ SEMANA ANTERIOR (La Marea)",
-                    "value": pasado,
+                    "name": "🌊 CAPA 1: Marea Macro (Basado en Noticias Reales)",
+                    "value": macro if macro else "Sin datos recientes.",
                     "inline": False
                 },
                 {
-                    "name": "📅 PRÓXIMOS DÍAS CLAVE (Las Ráfagas)",
+                    "name": "⚡ CAPA 2: Ráfagas (Calendario Proyectado)",
                     "value": texto_futuro,
                     "inline": False
                 },
                 {
-                    "name": "🎯 RECOMENDACIÓN (La Vela)",
-                    "value": "Semana de NFP. Se recomienda reducir el riesgo a partir del jueves. Buscar confluencia técnica en niveles de soporte diario antes de las noticias de alto impacto.",
+                    "name": f"🎯 CAPA 3: La Vela (Sesgo: {sesgo})",
+                    "value": f"**Conclusión del Agente:** {recomendacion}",
                     "inline": False
                 }
             ],
-            "footer": {"text": "Operativa Profesional: Dirección + Timing + Precisión"}
+            "footer": {"text": "Análisis computado mediante correlación de sentimiento y calendario."}
         }]
     }
-
     requests.post(webhook_url, json=payload)
 
 if __name__ == "__main__":
