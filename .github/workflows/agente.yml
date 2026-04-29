@@ -34,5 +34,4 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           NEWS_API_KEY:        ${{ secrets.NEWS_API_KEY }}
           FINNHUB_API_KEY:     ${{ secrets.FINNHUB_API_KEY }}
-          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
         run: python agente_inteligente.py
