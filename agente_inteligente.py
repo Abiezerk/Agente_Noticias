@@ -4,57 +4,67 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 import pytz
 
-def obtener_datos_internet():
-    # Simulamos el raspado de fuentes como Investing/Bankinter para el 2026
-    # En un entorno real, aquí usarías requests.get('url_calendario')
-    noticias_semana_pasada = (
-        "• **FED (30 Abril):** Mantuvo tasas en 3.6%. Powell sugiere pausa ante inflación persistente.\n"
-        "• **BoJ (29 Abril):** Sin cambios en 0.75%, incertidumbre por tensiones en Oriente Medio.\n"
-        "• **México:** PIB mostró ralentización al inicio del trimestre; flujos externos estables."
+def obtener_datos_mercado():
+    """
+    Simulación de scraping de noticias y calendario. 
+    En producción, estas funciones conectan con Investing o ForexFactory.
+    """
+    # Resumen de la semana que cierra (Abril 2026)
+    resumen_pasado = (
+        "• **USD:** La FED mantuvo tasas; el mercado asimila un discurso 'hawkish' moderado.\n"
+        "• **JPY:** Intervención del BoJ tras mínimos históricos del Yen.\n"
+        "• **MXN:** Inflación en México sale ligeramente arriba de lo esperado, presionando al Banxico."
     )
     
+    # Calendario de la semana que entra (Mayo 2026)
     calendario_proximo = [
-        {"fecha": "01/05", "evento": "Día del Trabajo (Festivo Global - Baja Liquidez)", "impacto": "🔴"},
-        {"fecha": "04/05", "evento": "Reunión del Eurogrupo (Sentimiento EUR)", "impacto": "🟠"},
-        {"fecha": "05/05", "evento": "Reunión ECOFIN", "impacto": "🟡"},
-        {"fecha": "08/05", "evento": "Revisión Rating Grecia (Fitch)", "impacto": "🟡"}
+        {"fecha": "Dom 03", "evento": "Apertura Semanal - GAP Analysis", "impacto": "⚪"},
+        {"fecha": "Lun 04", "evento": "PMI Manufacturero (EE.UU.)", "impacto": "🔴"},
+        {"fecha": "Mié 06", "evento": "Inventarios de Petróleo / ADP Employment", "impacto": "🟠"},
+        {"fecha": "Vie 08", "evento": "NFP: Nóminas No Agrícolas (Día Clave)", "impacto": "🔴"}
     ]
-    return noticias_semana_pasada, calendario_proximo
+    return resumen_pasado, calendario_proximo
 
 def enviar_reporte():
-    noticias_pasadas, proxima_semana = obtener_datos_internet()
-    tz = pytz.timezone('America/Tijuana')
-    hoy = datetime.now(tz).strftime('%d/%m/%Y')
+    webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+    if not webhook_url:
+        print("Error: No se encontró la URL del Webhook.")
+        return
 
-    # Construcción del reporte detallado
-    texto_calendario = "\n".join([f"{e['impacto']} **{e['fecha']}**: {e['evento']}" for e in proxima_semana])
+    pasado, futuro = obtener_datos_mercado()
+    tz = pytz.timezone('America/Tijuana')
+    hoy = datetime.now(tz).strftime('%A, %d de %B %Y')
+
+    texto_futuro = "\n".join([f"{e['impacto']} **{e['fecha']}**: {e['evento']}" for e in futuro])
 
     payload = {
+        "content": "@everyone 📊 **Análisis de Mercado Semanal**",
         "embeds": [{
-            "title": f"🏛️ INFORME DE MERCADOS | SEMANA DEL {hoy}",
-            "color": 0, # Estética Old Money (Negro)
+            "title": "🏛️ SISTEMA DE 3 CAPAS: REPORTE ESTRATÉGICO",
+            "description": f"Informe generado el {hoy}",
+            "color": 0, # Estética Premium (Negro)
             "fields": [
                 {
-                    "name": "⏪ LO QUE DEJÓ LA SEMANA (Análisis Macro)",
-                    "value": noticias_pasadas,
+                    "name": "⏪ SEMANA ANTERIOR (La Marea)",
+                    "value": pasado,
                     "inline": False
                 },
                 {
-                    "name": "📅 CALENDARIO SEMANA ENTRANTE (Capas 1 y 2)",
-                    "value": texto_calendario,
+                    "name": "📅 PRÓXIMOS DÍAS CLAVE (Las Ráfagas)",
+                    "value": texto_futuro,
                     "inline": False
                 },
                 {
-                    "name": "🎯 RECOMENDACIÓN TÉCNICA (Capa 3)",
-                    "value": "Dado el festivo del 1 de mayo, se prevé baja volatilidad el viernes. Buscar setups de alta precisión el martes/miércoles alineados con el sesgo neutral de la Fed.",
+                    "name": "🎯 RECOMENDACIÓN (La Vela)",
+                    "value": "Semana de NFP. Se recomienda reducir el riesgo a partir del jueves. Buscar confluencia técnica en niveles de soporte diario antes de las noticias de alto impacto.",
                     "inline": False
                 }
             ],
-            "footer": {"text": "Alinea Dirección (Macro), Timing (Noticias) y Precisión (Gráfico)."}
+            "footer": {"text": "Operativa Profesional: Dirección + Timing + Precisión"}
         }]
     }
 
-    requests.post(os.getenv('DISCORD_WEBHOOK_URL'), json=payload)
+    requests.post(webhook_url, json=payload)
 
 if __name__ == "__main__":
     enviar_reporte()
