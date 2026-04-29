@@ -1,71 +1,67 @@
-import yfinance as yf
-import os
 import requests
+from bs4 import BeautifulSoup
+import os
 from datetime import datetime
 import pytz
 
-def obtener_datos_reales():
-    # Sensores de activos clave para tus cBots
-    sensores = yf.Tickers('GC=F ^GSPC EURUSD=X')
-    titulares = []
+def obtener_calendario_real():
+    # Usamos un Proxy para evitar que GitHub sea bloqueado
+    # Puedes usar ScraperAPI (5000 peticiones gratis al mes)
+    SCRAPER_API_KEY = os.getenv('SCRAPER_API_KEY') 
+    target_url = "https://www.investing.com/economic-calendar/"
     
+    # Si no tienes la key de ScraperAPI aún, el código intentará conexión directa con headers limpios
+    if SCRAPER_API_KEY:
+        url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={target_url}"
+    else:
+        url = target_url
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
+    eventos_finales = []
     try:
-        # Combinamos noticias de Oro y S&P500 para mayor cobertura
-        raw_data = sensores.tickers['GC=F'].news + sensores.tickers['^GSPC'].news
+        response = requests.get(url, headers=headers, timeout=30)
+        if response.status_code != 200:
+            return [f"⚠️ Bloqueo detectado (Status {response.status_code}). Necesitas SCRAPER_API_KEY."]
+            
+        soup = BeautifulSoup(response.content, 'html.parser')
+        tabla = soup.find('table', {'id': 'economicCalendarData'})
+        filas = tabla.find_all('tr', {'class': 'js-event-item'})
         
-        for n in raw_data:
-            # Extracción robusta del título
-            texto = n.get('title') or n.get('headline')
-            if not texto: continue
+        for fila in filas:
+            # Detectamos las estrellas de impacto
+            impacto_td = fila.find('td', {'class': 'sentiment'})
+            estrellas = impacto_td.find_all('i', {'class': 'grayFullBullishIcon'})
             
-            # Si el titular es real, lo añadimos (quitamos la plantilla de "Noticia de mercado")
-            if len(texto) > 10:
-                # Marcamos con 🔴 si detecta algo crítico, si no, con 🔹
-                icon = "🔴" if any(c in texto.lower() for c in ['fed', 'war', 'rates', 'fomc', 'conflict']) else "🔹"
-                titulares.append(f"{icon} {texto}")
+            if len(estrellas) >= 3: # Solo Alta Volatilidad
+                hora = fila.find('td', {'class': 'time'}).text.strip()
+                pais = fila.find('td', {'class': 'flagCur'}).text.strip()
+                evento = fila.find('td', {'class': 'event'}).text.strip()
+                eventos_finales.append(f"🔴 **{hora}** | {pais}: {evento}")
 
-        # Si por algún motivo Yahoo no devuelve nada, usamos una fuente alternativa de respaldo
-        if not titulares:
-            titulares = ["⚠️ Sin titulares recientes en Yahoo Finance. Revisar flujo en cTrader."]
-            
     except Exception as e:
-        titulares = [f"❌ Error técnico en Capa 1: {str(e)}"]
+        return [f"❌ Error de conexión: {str(e)}"]
 
-    # Capa 2: Eventos confirmados para hoy Miércoles 29/04
-    eventos = [
-        "🏛️ **FED Interest Rate Decision** (Hoy - Crítico)",
-        "🎤 **FOMC Press Conference** (Hoy - Alta Volatilidad)",
-        "📊 **EIA Crude Oil Inventories** (Impacto en WTI)"
-    ]
-    
-    return titulares[:5], eventos
+    return eventos_finales[:8] if eventos_finales else ["🔹 Sin noticias de alto impacto hoy."]
 
 def enviar_reporte():
     webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
-    noticias, eventos = obtener_datos_reales()
+    tz = pytz.timezone('America/Tijuana')
+    fecha_hoy = datetime.now(tz).strftime('%d/%m/%Y %H:%M')
     
-    # Análisis de Sesgo (La Vela)
-    texto = " ".join(noticias).lower()
-    if 'war' in texto or 'missile' in texto:
-        sesgo, color = "⚠️ RISK-OFF / GUERRA", 0xcc0000
-        concl = "Se detectan titulares bélicos. El Oro está bajo presión alcista. Protege tus posiciones."
-    elif 'fed' in texto or 'rates' in texto:
-        sesgo, color = "⚖️ DÍA DE FED / MACRO", 0x00aaff
-        concl = "Atención a las tasas. El mercado espera el comunicado oficial. Rango lateral hasta la noticia."
-    else:
-        sesgo, color = "NEUTRAL", 0x2b2d31
-        concl = "Flujo estándar. Seguir estructura técnica en cTrader."
-
+    eventos = obtener_calendario_real()
+    
     payload = {
-        "content": "@everyone 📡 **Agente v8.0 | Conexión Directa Yahoo**",
         "embeds": [{
-            "title": f"🛡️ INTELIGENCIA DE MERCADO | {datetime.now().strftime('%d/%m/%Y')}",
-            "color": color,
+            "title": f"🛰️ RADAR MACRO RECURRENTE | {fecha_hoy}",
+            "color": 0x00ff00 if "🔴" in str(eventos) else 0x2b2d31,
             "fields": [
-                {"name": "🌊 CAPA 1: Marea (Geopolítica y Macro)", "value": "\n".join(noticias), "inline": False},
-                {"name": "⚡ CAPA 2: Ráfagas (Catalizadores de Hoy)", "value": "\n".join(eventos), "inline": False},
-                {"name": "🎯 CAPA 3: La Vela", "value": f"**Sesgo:** {sesgo}\n**Conclusión:** {concl}", "inline": False}
-            ]
+                {"name": "📅 Calendario de Alta Volatilidad", "value": "\n".join(eventos), "inline": False},
+                {"name": "⚙️ Estado del Sistema", "value": "Extracción dinámica vía Proxy.", "inline": True}
+            ],
+            "footer": {"text": "Tijuana Local Time | Agente v11.0"}
         }]
     }
     requests.post(webhook_url, json=payload)
