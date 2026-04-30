@@ -3,7 +3,7 @@ name: Sentinel v2.1 — Agente de Inteligencia Financiera
 on:
   schedule:
     # Lunes a viernes a las 13:00 UTC = 06:00 AM Tijuana (PDT)
-    - cron: '21 13 * * 1-5'
+    - cron: '0 13 * * 1-5'
   workflow_dispatch:
 
 env:
