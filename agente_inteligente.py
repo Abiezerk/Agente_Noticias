@@ -1,6 +1,7 @@
 import os
 import json
 import requests
+import anthropic
 import pytz
 from datetime import datetime, timedelta
 
@@ -14,11 +15,15 @@ def calcular_ventanas():
     hoy = datetime.now(TIJUANA_TZ)
 
     # CAPA 1: desde el domingo pasado hasta hoy
-    dias_desde_domingo = (hoy.weekday() + 1) % 7  # lunes=0 → domingo fue hace 1 día, domingo=0 → hoy
+    # FIX: si hoy ES domingo, retrocedemos 7 días extra para incluir el domingo anterior
+    dias_desde_domingo = (hoy.weekday() + 1) % 7
+    if dias_desde_domingo == 0:
+        dias_desde_domingo = 7  # si hoy es domingo, tomar desde el domingo PASADO (7 días atrás)
+
     domingo_pasado = hoy - timedelta(days=dias_desde_domingo)
 
     # CAPA 2: desde hoy hasta el próximo domingo
-    dias_hasta_domingo = (6 - hoy.weekday()) % 7  # 0 si hoy es domingo, n días si no
+    dias_hasta_domingo = (6 - hoy.weekday()) % 7
     if dias_hasta_domingo == 0:
         dias_hasta_domingo = 7  # si hoy ES domingo, apunta al siguiente
     proximo_domingo = hoy + timedelta(days=dias_hasta_domingo)
@@ -44,7 +49,7 @@ def traducir_titulares(titulares_con_prefijo: list[str]) -> list[str]:
             try:
                 texto_es = GoogleTranslator(source='auto', target='es').translate(texto)
             except Exception:
-                texto_es = texto  # fallback al original si falla uno
+                texto_es = texto
             traducidos.append(f"{emoji} {texto_es}")
         return traducidos
     except Exception as e:
@@ -119,6 +124,7 @@ def obtener_calendario_alto_impacto(desde: str, hasta: str):
     url = f'https://finnhub.io/api/v1/calendar/economic?from={desde}&to={hasta}&token={api_key}'
 
     eventos_formateados = []
+    raw_eventos         = []
     try:
         res = requests.get(url, timeout=30)
         res.raise_for_status()
@@ -132,7 +138,8 @@ def obtener_calendario_alto_impacto(desde: str, hasta: str):
             prev   = e.get('prev', '')
             est    = e.get('estimate', '')
 
-            # Mostramos fecha completa (día/mes) ya que cubre toda la semana
+            raw_eventos.append(f"{pais}: {evento} (Est: {est}, Prev: {prev})")
+
             try:
                 dt = datetime.strptime(fecha[:10], '%Y-%m-%d')
                 fecha_fmt = dt.strftime('%a %d/%m').capitalize()
@@ -148,89 +155,111 @@ def obtener_calendario_alto_impacto(desde: str, hasta: str):
             eventos_formateados.append(linea)
 
     except requests.exceptions.HTTPError as e:
-        return [f"❌ Error FinnHub HTTP {e.response.status_code}"]
+        return [f"❌ Error FinnHub HTTP {e.response.status_code}"], []
     except Exception as e:
-        return [f"❌ Fallo calendario: {str(e)}"]
+        return [f"❌ Fallo calendario: {str(e)}"], []
 
-    return eventos_formateados if eventos_formateados else ["🔹 Sin eventos de alto impacto esta semana."]
+    if not eventos_formateados:
+        return ["🔹 Sin eventos de alto impacto esta semana."], []
+
+    return eventos_formateados, raw_eventos
 
 
 # ─────────────────────────────────────────────
-# CAPA 3: SESGO + RECOMENDACIONES ESPECÍFICAS
-# Para XAUUSD, US30 y US500
+# CAPA 3: RECOMENDACIONES IA vía Claude API
 # ─────────────────────────────────────────────
-def analizar_sesgo_y_recomendaciones(raw_titulares: list[str], calendario: list[str]) -> tuple[str, str, int]:
-    texto_total   = " ".join(raw_titulares).lower()
-    cal_texto     = " ".join(calendario).lower()
+def obtener_recomendaciones_ia(
+    raw_titulares: list[str],
+    raw_eventos: list[str],
+    desde_noticias: str,
+    hasta_noticias: str
+) -> tuple[str, str, int]:
 
-    tiene_guerra   = any(w in texto_total for w in ['war', 'attack', 'missile', 'invasion', 'conflict'])
-    tiene_fed      = any(w in texto_total + cal_texto for w in ['fed', 'fomc', 'rate', 'powell', 'cpi', 'pce', 'nfp', 'interest rate'])
-    tiene_recesion = any(w in texto_total for w in ['recession', 'downturn', 'contraction', 'gdp'])
-    tiene_inflacion = any(w in texto_total + cal_texto for w in ['inflation', 'cpi', 'pce'])
-
-    # Sesgo principal
-    if tiene_guerra and tiene_fed:
-        sesgo = "🔥 RIESGO EXTREMO: Guerra + FED activos simultáneamente"
-        color = 0x7B0000
-        recomendaciones = (
-            "**XAUUSD 🥇:** Sesgo fuertemente alcista. Refugio seguro activo. "
-            "Buscar largos en retrocesos, evitar cortos.\n"
-            "**US30 📊:** Alta volatilidad. Sin dirección clara — evitar posiciones de swing, "
-            "solo scalps en zonas de soporte confirmado.\n"
-            "**US500 📈:** Igual que US30. Presión vendedora probable. "
-            "Esperar datos antes de entrar."
-        )
-    elif tiene_guerra:
-        sesgo = "⚠️ RISK-OFF: Tensión Geopolítica dominante"
-        color = 0x990000
-        recomendaciones = (
-            "**XAUUSD 🥇:** Alcista. Demanda de refugio activa. "
-            "Priorizar largos, stops ajustados bajo soportes clave.\n"
-            "**US30 📊:** Bajista probable. Índices bajo presión vendedora. "
-            "Cautela con largos, cortos en resistencias.\n"
-            "**US500 📈:** Igual presión bajista. Evitar compras en zona de resistencia semanal."
-        )
-    elif tiene_fed and tiene_inflacion:
-        sesgo = "⚖️ MACRO CRÍTICO: FED + Datos de Inflación en la semana"
-        color = 0x0055FF
-        recomendaciones = (
-            "**XAUUSD 🥇:** Volátil. Si datos de inflación > estimado → bajista para Oro. "
-            "Si < estimado → alcista. No entrar antes del dato.\n"
-            "**US30 📊:** Alta sensibilidad. Dato hawkish → caída. Dato dovish → rally. "
-            "Esperar reacción inicial y operar el retroceso.\n"
-            "**US500 📈:** Mismo comportamiento que US30. "
-            "Gestionar tamaño de posición — semana de alta volatilidad."
-        )
-    elif tiene_fed:
-        sesgo = "⚖️ VOLATILIDAD MACRO: Evento FED en el radar"
-        color = 0x0055FF
-        recomendaciones = (
-            "**XAUUSD 🥇:** Neutral-volátil. Esperar definición post-FED para operar dirección.\n"
-            "**US30 📊:** Posible expansión de rango. Reducir tamaño de posición esta semana.\n"
-            "**US500 📈:** Similar. Priorizar gestión de riesgo sobre búsqueda de setups."
-        )
-    elif tiene_recesion:
-        sesgo = "📉 SESGO BAJISTA MACRO: Riesgo de recesión en el radar"
-        color = 0xFF8800
-        recomendaciones = (
-            "**XAUUSD 🥇:** Alcista a mediano plazo como refugio. "
-            "Largo en soportes semanales.\n"
-            "**US30 📊:** Bajista. Evitar largos en zona de resistencia. "
-            "Cortos bajo mínimos previos con confirmación.\n"
-            "**US500 📈:** Mismo sesgo bajista. Vigilar niveles de soporte macro."
-        )
-    else:
-        sesgo = "🟢 NEUTRAL / TÉCNICO: Sin catalizador macro dominante"
-        color = 0x2B2D31
-        recomendaciones = (
-            "**XAUUSD 🥇:** Operar niveles técnicos. Sin sesgo fundamental claro — "
-            "respetar S/R del gráfico semanal y diario.\n"
-            "**US30 📊:** Semana técnica. Buscar continuación de tendencia vigente "
-            "en zonas de valor (EMA / retrocesos Fibonacci).\n"
-            "**US500 📈:** Ídem. Priorizar setups de alta probabilidad con R:R mínimo 1:2."
+    api_key = os.getenv('ANTHROPIC_API_KEY')
+    if not api_key:
+        return (
+            "⚠️ SESGO NO DISPONIBLE",
+            "⚠️ ANTHROPIC_API_KEY no configurada — recomendaciones IA no disponibles.",
+            0x888888
         )
 
-    return sesgo, recomendaciones, color
+    noticias_texto  = "\n".join(raw_titulares) if raw_titulares else "Sin noticias disponibles."
+    calendario_texto = "\n".join(raw_eventos)  if raw_eventos  else "Sin eventos de alto impacto."
+
+    prompt_usuario = f"""Aquí están los datos recopilados por el agente Sentinel esta semana:
+
+📰 NOTICIAS MACRO & GEOPOLÍTICAS ({desde_noticias} → {hasta_noticias}):
+{noticias_texto}
+
+📅 CALENDARIO ECONÓMICO DE ALTO IMPACTO (próximos días):
+{calendario_texto}
+
+Con base en esta información, proporciona:
+1. Una línea de SESGO SEMANAL (ej: "RISK-OFF — Tensión geopolítica dominante")
+2. Recomendaciones concretas de trading para esta semana para los siguientes instrumentos:
+   - XAUUSD (Oro)
+   - US30 (Dow Jones)
+   - US500 (S&P 500)
+   - NAS100 (Nasdaq 100)
+
+Formato de respuesta esperado:
+SESGO: [tu sesgo aquí]
+
+XAUUSD: [tu recomendación]
+US30: [tu recomendación]
+US500: [tu recomendación]
+NAS100: [tu recomendación]
+
+Sé directo, concreto y accionable. Máximo 3 oraciones por instrumento."""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            system=(
+                "Eres un analista de mercados financieros con 35 años de experiencia y un CI de 180. "
+                "Interpreta las noticias de la semana pasada hasta el día de hoy que recopiló el agente "
+                "para ti y da recomendaciones para los instrumentos solicitados. "
+                "Responde siempre en español. Sé preciso, directo y profesional."
+            ),
+            messages=[{"role": "user", "content": prompt_usuario}]
+        )
+
+        respuesta = message.content[0].text.strip()
+
+        # Extraer sesgo de la primera línea
+        lineas = respuesta.split('\n')
+        sesgo_linea = next((l for l in lineas if l.upper().startswith('SESGO:')), None)
+        sesgo = sesgo_linea.replace('SESGO:', '').replace('Sesgo:', '').strip() if sesgo_linea else "Ver recomendaciones abajo"
+
+        # Las recomendaciones son todo menos la línea de sesgo
+        recomendaciones = '\n'.join(
+            l for l in lineas
+            if not l.upper().startswith('SESGO:') and l.strip()
+        ).strip()
+
+        # Color según palabras clave en el sesgo
+        sesgo_lower = sesgo.lower()
+        if any(w in sesgo_lower for w in ['extremo', 'guerra', 'war', 'crítico']):
+            color = 0x7B0000
+        elif any(w in sesgo_lower for w in ['risk-off', 'bajista', 'tensión', 'conflict']):
+            color = 0x990000
+        elif any(w in sesgo_lower for w in ['fed', 'macro', 'volátil', 'inflación']):
+            color = 0x0055FF
+        elif any(w in sesgo_lower for w in ['alcista', 'bullish', 'positivo']):
+            color = 0x00AA44
+        else:
+            color = 0x2B2D31
+
+        return f"🤖 {sesgo}", recomendaciones, color
+
+    except Exception as e:
+        return (
+            "❌ Error IA",
+            f"No se pudieron obtener recomendaciones de Claude: {str(e)}",
+            0x888888
+        )
 
 
 # ─────────────────────────────────────────────
@@ -249,15 +278,25 @@ def ejecutar_agente():
     print(f"📅 Calendario: {hoy_str} → {proximo_domingo}")
 
     noticias, raw_titulares = obtener_noticias_geopoliticas(domingo_pasado, hoy_str)
-    calendario              = obtener_calendario_alto_impacto(hoy_str, proximo_domingo)
-    sesgo, recomendaciones, color = analizar_sesgo_y_recomendaciones(raw_titulares, calendario)
+    resultado_calendario    = obtener_calendario_alto_impacto(hoy_str, proximo_domingo)
+
+    # obtener_calendario_alto_impacto ahora devuelve una tupla (formateados, raw)
+    if isinstance(resultado_calendario, tuple):
+        calendario, raw_eventos = resultado_calendario
+    else:
+        calendario  = resultado_calendario  # fallback si solo devolvió lista (error)
+        raw_eventos = []
+
+    sesgo, recomendaciones, color = obtener_recomendaciones_ia(
+        raw_titulares, raw_eventos, domingo_pasado, hoy_str
+    )
 
     def safe_value(lista):
         texto = "\n".join(lista)
         return texto[:1024] if texto else "Sin datos disponibles."
 
     payload = {
-        "content": "@everyone 🛰️ **Sentinel v2.1: Reporte Semanal de Inteligencia**",
+        "content": "@everyone 🛰️ **Sentinel v2.2: Reporte Semanal de Inteligencia**",
         "embeds": [{
             "title": f"🛡️ INTELIGENCIA DE MERCADO | {ahora} (Tijuana)",
             "color": color,
@@ -273,17 +312,17 @@ def ejecutar_agente():
                     "inline": False
                 },
                 {
-                    "name": "🎯 CAPA 3 — Sesgo Semanal",
+                    "name": "🎯 CAPA 3 — Sesgo Semanal IA",
                     "value": f"**{sesgo}**",
                     "inline": False
                 },
                 {
-                    "name": "📌 Recomendaciones por Instrumento",
+                    "name": "📌 Recomendaciones por Instrumento (Claude AI)",
                     "value": recomendaciones[:1024],
                     "inline": False
                 }
             ],
-            "footer": {"text": "Sentinel v2.1 | Tijuana Local Time | Datos: NewsAPI + FinnHub"}
+            "footer": {"text": "Sentinel v2.2 | Tijuana Local Time | Datos: NewsAPI + FinnHub | IA: Claude Sonnet"}
         }]
     }
 
