@@ -215,7 +215,7 @@ Sé directo, concreto y accionable. Máximo 3 oraciones por instrumento."""
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=1024,
             system=(
                 "Eres un analista de mercados financieros con 35 años de experiencia y un CI de 180. "
