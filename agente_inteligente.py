@@ -64,6 +64,45 @@ def calcular_ventanas():
 # ════════════════════════════════════════════════════════════
 #  CAPA 0 — PRECIOS Y ANÁLISIS TÉCNICO + PERFIL DE VOLUMEN
 # ════════════════════════════════════════════════════════════
+def diagnosticar_twelve_data() -> str:
+    """
+    Verifica conectividad y autenticación con Twelve Data antes de pedir datos.
+    Retorna: 'ok' | mensaje de error descriptivo.
+    """
+    api_key = os.getenv('TWELVE_DATA_API_KEY')
+    if not api_key:
+        return "TWELVE_DATA_API_KEY no está definida en las variables de entorno."
+
+    try:
+        # /api_usage es el endpoint más liviano — 0 créditos, solo verifica auth
+        r = requests.get(
+            f"https://api.twelvedata.com/api_usage?apikey={api_key}",
+            timeout=10
+        )
+        if r.status_code == 403:
+            body = r.text[:120]
+            return f"HTTP 403 — posible bloqueo de red o dominio no permitido. Body: {body}"
+        if r.status_code == 401:
+            return "HTTP 401 — API key inválida o expirada."
+        if r.status_code != 200:
+            return f"HTTP {r.status_code} inesperado. Body: {r.text[:120]}"
+
+        data = r.json()
+        if data.get('status') == 'error':
+            return f"Twelve Data error: {data.get('message', 'desconocido')}"
+
+        plan = data.get('plan', '?')
+        usado = data.get('current_usage', '?')
+        limite = data.get('daily_limit', '?')
+        print(f"  🔑 Twelve Data OK — plan={plan} | uso hoy={usado}/{limite}")
+        return 'ok'
+
+    except requests.exceptions.ConnectionError as e:
+        return f"Error de conexión — no se puede alcanzar api.twelvedata.com: {e}"
+    except Exception as e:
+        return f"Error inesperado en diagnóstico: {type(e).__name__}: {e}"
+
+
 def obtener_candles_twelvedata(simbolo: str, tipo: str, dias: int = M15_DIAS) -> list[dict]:
     """
     Descarga velas M15 de los últimos `dias` días desde Twelve Data.
@@ -86,10 +125,8 @@ def obtener_candles_twelvedata(simbolo: str, tipo: str, dias: int = M15_DIAS) ->
     #   ETFs:  ~26 velas/día × 7 = 182 (pedimos 200 con margen)
     outputsize = 700 if tipo == 'forex' else 200
 
-    # Para ETFs/stocks necesitamos especificar exchange para obtener M15 extendido
-    exchange_param = ""
-    if tipo == 'etf':
-        exchange_param = "&exchange=NASDAQ"
+    # Para ETFs/stocks el exchange es opcional pero evita ambigüedades
+    exchange_param = "&exchange=NASDAQ" if tipo == 'etf' else ""
 
     url = (
         f"https://api.twelvedata.com/time_series"
@@ -103,17 +140,34 @@ def obtener_candles_twelvedata(simbolo: str, tipo: str, dias: int = M15_DIAS) ->
 
     try:
         res = requests.get(url, timeout=30)
+
+        # Detectar bloqueo de red antes de intentar parsear JSON
+        if res.status_code == 403 and 'allowlist' in res.text.lower():
+            print(f"  🚫 {simbolo}: dominio api.twelvedata.com bloqueado por el proxy de red.")
+            print(f"     Solución: agrega 'api.twelvedata.com' a la allowlist de red del servidor.")
+            return []
+
+        if res.status_code == 401:
+            print(f"  🔑 {simbolo}: API key de Twelve Data inválida o expirada.")
+            return []
+
         res.raise_for_status()
         data = res.json()
 
-        # Twelve Data retorna {"status": "error", "message": "..."} en errores
+        # Twelve Data retorna {"status": "error", "message": "..."} en errores de negocio
         if data.get('status') == 'error':
-            print(f"  ⚠️  Twelve Data error para {simbolo}: {data.get('message', 'desconocido')}")
+            codigo = data.get('code', '?')
+            msg    = data.get('message', 'desconocido')
+            print(f"  ⚠️  Twelve Data [{simbolo}] error {codigo}: {msg}")
+            # Código 400 = símbolo no encontrado, 429 = rate limit
+            if codigo == 429:
+                print(f"     Rate limit alcanzado — esperar 60s entre ejecuciones.")
             return []
 
         valores = data.get('values', [])
         if not valores:
-            print(f"  ⚠️  Twelve Data: sin valores para {simbolo}")
+            print(f"  ⚠️  Twelve Data: sin valores para {simbolo} (respuesta vacía)")
+            print(f"     Meta recibida: {data.get('meta', {})}")
             return []
 
         # Convertir y filtrar al rango de días solicitado
@@ -135,11 +189,26 @@ def obtener_candles_twelvedata(simbolo: str, tipo: str, dias: int = M15_DIAS) ->
                 'volume':   float(v.get('volume', 0) or 0),
             })
 
-        print(f"  📥 {simbolo} ({tipo}): {len(candles)} velas M15 descargadas")
+        if not candles:
+            primera = valores[-1]['datetime'] if valores else '?'
+            ultima  = valores[0]['datetime']  if valores else '?'
+            print(f"  ⚠️  {simbolo}: se recibieron {len(valores)} velas pero ninguna dentro del rango.")
+            print(f"     Rango recibido: {primera} → {ultima}")
+            print(f"     Rango esperado: desde {fecha_limite.strftime('%Y-%m-%d')} en adelante.")
+            return []
+
+        print(f"  📥 {simbolo} ({tipo}): {len(candles)} velas M15 | "
+              f"{candles[0]['datetime']} → {candles[-1]['datetime']}")
         return candles
 
+    except requests.exceptions.ConnectionError as e:
+        print(f"  ❌ {simbolo}: sin conexión a api.twelvedata.com — {e}")
+        return []
+    except requests.exceptions.Timeout:
+        print(f"  ❌ {simbolo}: timeout (>30s) conectando a Twelve Data")
+        return []
     except Exception as e:
-        print(f"  ❌ Error obteniendo candles M15 Twelve Data {simbolo}: {e}")
+        print(f"  ❌ Error inesperado obteniendo candles M15 {simbolo}: {type(e).__name__}: {e}")
         return []
 
 
@@ -306,9 +375,13 @@ def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
       - ATR(14) sobre rangos verdaderos M15
       - Perfil de Volumen completo (POC, VAH, VAL, HVN, LVN)
     """
-    api_key = os.getenv('TWELVE_DATA_API_KEY')
-    if not api_key:
-        return {}, "TWELVE_DATA_API_KEY no configurada – análisis técnico no disponible."
+    # ── Diagnóstico previo: key + conectividad ──────────────
+    print("🔍 Verificando conexión a Twelve Data...")
+    diag = diagnosticar_twelve_data()
+    if diag != 'ok':
+        msg = f"⚠️ Twelve Data no disponible: {diag}"
+        print(f"  {msg}")
+        return {}, msg
 
     resumen_dict = {}
     bloques_texto = []
@@ -676,17 +749,27 @@ def ejecutar_agente():
         texto = "\n".join(lista)
         return texto[:1024] if texto else "Sin datos disponibles."
 
-    fields = [
-        {
-            "name": f"📊 CAPA 0 — Análisis Técnico + Perfil de Volumen (7d)",
-            "value": (
-                "\n\n".join(
-                    formatear_campo_tecnico(inst, resumen_tecnico.get(inst, {'error': 'N/A'}))
-                    for inst in ['XAUUSD', 'US30', 'NAS100']
-                )
-            )[:1024],
+    # Construir campos Capa 0 — uno por instrumento para no chocar con el límite de 1024 chars
+    def campo_tecnico_discord(inst):
+        datos = resumen_tecnico.get(inst)
+        if not datos:
+            # Sin datos: mostrar el mensaje de diagnóstico
+            motivo = analisis_tecnico_texto if analisis_tecnico_texto else "Sin datos — revisar logs del servidor."
+            return {
+                "name": f"📊 CAPA 0 — {inst} (M15)",
+                "value": f"⚠️ {motivo[:500]}",
+                "inline": False
+            }
+        return {
+            "name": f"📊 CAPA 0 — {inst} (M15, 7d)",
+            "value": formatear_campo_tecnico(inst, datos),
             "inline": False
-        },
+        }
+
+    fields = [
+        campo_tecnico_discord('XAUUSD'),
+        campo_tecnico_discord('US30'),
+        campo_tecnico_discord('NAS100'),
         {
             "name": f"🌍 CAPA 1 — Noticias Macro & Geopolíticas (Dom {domingo_pasado} → Hoy)",
             "value": safe_value(noticias),
