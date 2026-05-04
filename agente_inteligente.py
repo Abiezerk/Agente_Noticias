@@ -33,15 +33,22 @@ RSI_PERIODO        = 14   # estándar Wilder, sobre cierres M15
 ATR_PERIODO        = 14   # estándar, sobre rangos verdaderos M15
 
 # Twelve Data: símbolo principal y tipo de instrumento
-# Usamos los índices reales, no ETFs proxy, para tener precios correctos:
-#   XAUUSD  → XAU/USD  (oro spot, forex)
-#   US30    → DJIA     (Dow Jones Industrial Average, índice)
-#   NAS100  → NDX      (Nasdaq 100, índice)
-# Twelve Data soporta DJIA y NDX en M15 con plan gratuito.
+# Cada instrumento tiene una lista de símbolos a intentar en orden.
+# Si el primero falla (plan/mercado), se intenta el siguiente automáticamente.
 TWELVE_DATA_SYMBOLS = {
-    "XAUUSD": {"symbol": "XAU/USD", "tipo": "forex"},
-    "US30":   {"symbol": "DJIA",    "tipo": "index"},   # Dow Jones índice real ~42,000
-    "NAS100": {"symbol": "NDX",     "tipo": "index"},   # Nasdaq 100 índice real ~19,000-20,000
+    "XAUUSD": {
+        "candidatos": [("XAU/USD", "forex")],
+        # Oro spot forex — funciona en todos los planes
+    },
+    "US30": {
+        "candidatos": [("DJIA", "index"), ("DIA", "etf")],
+        # DJIA = índice real ~42,000 | DIA = ETF proxy ~420 (fallback)
+    },
+    "NAS100": {
+        "candidatos": [("QQQ", "etf"), ("IXIC", "index"), ("NDX", "index")],
+        # QQQ funciona más consistentemente en Twelve Data plan gratuito
+        # NDX/IXIC como fallback si QQQ falla
+    },
 }
 
 
@@ -125,10 +132,10 @@ def obtener_candles_twelvedata(simbolo: str, tipo: str, dias: int = M15_DIAS) ->
 
     # outputsize por tipo:
     #   forex (XAU/USD): opera 24h → ~96 velas/día × 7 = 672 → pedimos 700
-    #   index (DJIA, NDX): opera ~6.5h/día → ~26 velas/día × 7 = 182 → pedimos 200
-    outputsize = 700 if tipo == 'forex' else 200
+    #   index/etf (DJIA, QQQ): opera ~6.5h/día → ~26 velas/día × 7 ≈ 200 → pedimos 250
+    outputsize = 700 if tipo == 'forex' else 250
 
-    # Los índices no necesitan exchange param; evitamos parámetros innecesarios
+    # exchange_param: ninguno para forex/index; NASDAQ solo para ETFs de NASDAQ
     exchange_param = ""
 
     url = (
@@ -257,56 +264,65 @@ def calcular_atr(candles: list[dict], periodo: int = 7) -> float:
     return round(sum(trs[-periodo:]) / min(len(trs), periodo), 4)
 
 
-def calcular_perfil_volumen(candles: list[dict], num_niveles: int = 20) -> dict:
+def calcular_perfil_volumen(candles: list[dict], num_niveles: int = None) -> dict:
     """
     Volume Profile simplificado:
     - Divide el rango total en `num_niveles` buckets de precio.
     - Distribuye el volumen de cada vela proporcionalmente por rango.
-    - Identifica HVN (High Volume Node) y LVN (Low Volume Node).
-    Retorna dict con: hvn, lvn, poc (Point of Control), vah, val.
+    - num_niveles es adaptativo si no se especifica: sqrt(n_velas) con mínimo 20, máximo 60.
+      Con pocas velas (índices M15 ~120 velas) esto evita buckets vacíos que distorsionan el POC.
+    - HVN: picos locales de volumen fuera del Value Area (soporte/resistencia real).
+    - LVN: valles locales entre HVNs (zonas de baja liquidez / aceleración).
+    Retorna dict con: poc, vah, val, hvn, lvn, rango_min, rango_max.
     """
     if not candles:
         return {}
 
-    precio_min = min(c['low'] for c in candles)
+    precio_min = min(c['low']  for c in candles)
     precio_max = max(c['high'] for c in candles)
     rango = precio_max - precio_min
     if rango == 0:
         return {}
 
+    # Resolución adaptativa: raíz cuadrada del número de velas, acotada
+    if num_niveles is None:
+        num_niveles = max(20, min(60, int(len(candles) ** 0.5)))
+
     bucket_size = rango / num_niveles
     buckets = [0.0] * num_niveles
 
     for c in candles:
-        vol = c['volume'] if c['volume'] > 0 else 1  # fallback para pares sin volumen real
+        # Usar volumen real si existe y es positivo; si no, ponderar por rango de vela
+        vol = c['volume'] if c['volume'] > 0 else (c['high'] - c['low'])
+        if vol <= 0:
+            vol = 1.0
         vela_rango = c['high'] - c['low']
         if vela_rango == 0:
-            idx = int((c['close'] - precio_min) / bucket_size)
-            idx = min(idx, num_niveles - 1)
+            idx = min(int((c['close'] - precio_min) / bucket_size), num_niveles - 1)
             buckets[idx] += vol
             continue
-        # Distribuir volumen de la vela entre los buckets que toca
         for b in range(num_niveles):
             b_low  = precio_min + b * bucket_size
             b_high = b_low + bucket_size
-            overlap = max(0, min(c['high'], b_high) - max(c['low'], b_low))
-            buckets[b] += vol * (overlap / vela_rango)
+            overlap = max(0.0, min(c['high'], b_high) - max(c['low'], b_low))
+            if overlap > 0:
+                buckets[b] += vol * (overlap / vela_rango)
 
     vol_total = sum(buckets)
     if vol_total == 0:
         return {}
 
-    # POC = bucket con mayor volumen
-    poc_idx = buckets.index(max(buckets))
+    # POC = bucket con mayor volumen acumulado
+    poc_idx   = buckets.index(max(buckets))
     poc_price = precio_min + (poc_idx + 0.5) * bucket_size
 
     # VAH / VAL: zona que contiene el 70% del volumen alrededor del POC
-    acum, vah_idx, val_idx = 0, poc_idx, poc_idx
     target = vol_total * 0.70
+    acum   = buckets[poc_idx]
     lo, hi = poc_idx, poc_idx
     while acum < target and (lo > 0 or hi < num_niveles - 1):
-        expand_lo = buckets[lo - 1] if lo > 0 else 0
-        expand_hi = buckets[hi + 1] if hi < num_niveles - 1 else 0
+        expand_lo = buckets[lo - 1] if lo > 0 else -1
+        expand_hi = buckets[hi + 1] if hi < num_niveles - 1 else -1
         if expand_lo >= expand_hi and lo > 0:
             lo -= 1
             acum += buckets[lo]
@@ -314,31 +330,32 @@ def calcular_perfil_volumen(candles: list[dict], num_niveles: int = 20) -> dict:
             hi += 1
             acum += buckets[hi]
         else:
-            lo -= 1
-            acum += buckets[lo]
+            break
     val_price = precio_min + (lo + 0.5) * bucket_size
     vah_price = precio_min + (hi + 0.5) * bucket_size
 
-    # HVN: top 3 buckets fuera de la VA que también son picos locales
-    hvn_buckets = sorted(
-        [(i, v) for i, v in enumerate(buckets) if i < lo or i > hi],
-        key=lambda x: x[1], reverse=True
-    )[:3]
-    hvn_prices = sorted([precio_min + (i + 0.5) * bucket_size for i, _ in hvn_buckets])
+    # HVN: picos locales fuera del Value Area (máximo local > ambos vecinos)
+    hvn_precios = []
+    for i in range(1, num_niveles - 1):
+        if (i < lo or i > hi) and buckets[i] > buckets[i-1] and buckets[i] > buckets[i+1]:
+            hvn_precios.append((buckets[i], precio_min + (i + 0.5) * bucket_size))
+    hvn_precios.sort(reverse=True)
+    hvn_prices = sorted([p for _, p in hvn_precios[:4]])  # top 4 HVNs ordenados por precio
 
-    # LVN: bottom 3 buckets (valles locales de volumen)
-    lvn_buckets = sorted(
-        [(i, v) for i, v in enumerate(buckets) if v > 0],
-        key=lambda x: x[1]
-    )[:3]
-    lvn_prices = sorted([precio_min + (i + 0.5) * bucket_size for i, _ in lvn_buckets])
+    # LVN: valles locales (mínimo local < ambos vecinos), con volumen > 0
+    lvn_precios = []
+    for i in range(1, num_niveles - 1):
+        if buckets[i] > 0 and buckets[i] < buckets[i-1] and buckets[i] < buckets[i+1]:
+            lvn_precios.append((buckets[i], precio_min + (i + 0.5) * bucket_size))
+    lvn_precios.sort()
+    lvn_prices = sorted([p for _, p in lvn_precios[:4]])  # top 4 LVNs ordenados por precio
 
     return {
-        'poc':  round(poc_price, 4),
-        'vah':  round(vah_price, 4),
-        'val':  round(val_price, 4),
-        'hvn':  [round(p, 4) for p in hvn_prices],
-        'lvn':  [round(p, 4) for p in lvn_prices],
+        'poc':       round(poc_price, 4),
+        'vah':       round(vah_price, 4),
+        'val':       round(val_price, 4),
+        'hvn':       [round(p, 4) for p in hvn_prices],
+        'lvn':       [round(p, 4) for p in lvn_prices],
         'rango_min': round(precio_min, 4),
         'rango_max': round(precio_max, 4),
     }
@@ -372,13 +389,9 @@ def analizar_tendencia(candles: list[dict]) -> str:
 def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
     """
     Obtiene y analiza velas M15 (7 días) de cada instrumento via Twelve Data.
-    Indicadores calculados en temporalidad M15:
-      - EMA50 y EMA200 para tendencia
-      - RSI(14) sobre cierres M15
-      - ATR(14) sobre rangos verdaderos M15
-      - Perfil de Volumen completo (POC, VAH, VAL, HVN, LVN)
+    Usa lista de candidatos por instrumento: si el primero falla intenta el siguiente.
+    Indicadores: EMA50/200 (tendencia), RSI(14), ATR(14), Perfil de Volumen adaptativo.
     """
-    # ── Diagnóstico previo: key + conectividad ──────────────
     print("🔍 Verificando conexión a Twelve Data...")
     diag = diagnosticar_twelve_data()
     if diag != 'ok':
@@ -390,13 +403,28 @@ def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
     bloques_texto = []
 
     for instrumento, cfg in TWELVE_DATA_SYMBOLS.items():
-        simbolo = cfg['symbol']
-        tipo    = cfg['tipo']
+        candidatos = cfg['candidatos']
+        candles    = []
+        simbolo_ok = None
+        tipo_ok    = None
 
-        candles = obtener_candles_twelvedata(simbolo, tipo, dias=M15_DIAS)
+        for simbolo, tipo in candidatos:
+            print(f"  🔎 {instrumento}: probando {simbolo} ({tipo})...")
+            candles = obtener_candles_twelvedata(simbolo, tipo, dias=M15_DIAS)
+            if candles:
+                simbolo_ok = simbolo
+                tipo_ok    = tipo
+                break
+            print(f"     ↳ Sin datos para {simbolo}, probando siguiente candidato...")
+
         if not candles:
-            resumen_dict[instrumento] = {'error': f'Sin datos de precio ({simbolo})'}
-            bloques_texto.append(f"{instrumento}: Sin datos disponibles desde Twelve Data ({simbolo}).")
+            candidatos_str = ", ".join(s for s, _ in candidatos)
+            resumen_dict[instrumento] = {
+                'error': f'Sin datos tras intentar: {candidatos_str}'
+            }
+            bloques_texto.append(
+                f"{instrumento}: Sin datos disponibles (intentados: {candidatos_str})."
+            )
             continue
 
         closes        = [c['close'] for c in candles]
@@ -407,9 +435,8 @@ def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
         tendencia = analizar_tendencia(candles)
         rsi       = calcular_rsi(closes, RSI_PERIODO)
         atr       = calcular_atr(candles, ATR_PERIODO)
-        perfil    = calcular_perfil_volumen(candles, num_niveles=40)
+        perfil    = calcular_perfil_volumen(candles)  # resolución adaptativa automática
 
-        # Interpretación RSI
         if rsi is not None:
             if rsi > 70:   rsi_interp = "sobrecomprado"
             elif rsi < 30: rsi_interp = "sobrevendido"
@@ -418,7 +445,8 @@ def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
             rsi_interp = "N/A"
 
         resumen_dict[instrumento] = {
-            'simbolo_fuente': simbolo,
+            'simbolo_fuente': simbolo_ok,
+            'tipo':           tipo_ok,
             'precio_actual':  precio_actual,
             'cambio_7d_pct':  cambio_pct,
             'tendencia':      tendencia,
@@ -429,22 +457,22 @@ def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
             'num_velas':      len(candles),
         }
 
-        # Texto para el prompt de Claude
+        # Texto para el prompt de Claude (RSI y ATR van al prompt de la IA
+        # pero NO se muestran al usuario en Discord — ver formatear_campo_tecnico)
         hvn_str = ", ".join(str(p) for p in perfil.get('hvn', [])) or "N/A"
         lvn_str = ", ".join(str(p) for p in perfil.get('lvn', [])) or "N/A"
         muestra_velas = candles[-8:]
 
         bloque = (
-            f"=== {instrumento} ({simbolo}) — Temporalidad M15 ===\n"
-            f"Fuente: Twelve Data | Velas procesadas: {len(candles)} M15 ({M15_DIAS} días)\n"
+            f"=== {instrumento} ({simbolo_ok}) — Temporalidad M15 ===\n"
+            f"Fuente: Twelve Data | Velas: {len(candles)} M15 ({M15_DIAS} días)\n"
             f"Rango 7d: {perfil.get('rango_min', 'N/A')} – {perfil.get('rango_max', 'N/A')}\n"
             f"Precio actual (último cierre M15): {precio_actual}\n"
             f"Cambio 7d: {cambio_pct:+.2f}%\n"
-            f"Tendencia (EMA{EMA_RAPIDA}/EMA{EMA_LENTA} en M15): {tendencia}\n"
+            f"Tendencia (EMA{EMA_RAPIDA}/EMA{EMA_LENTA} M15): {tendencia}\n"
             f"RSI({RSI_PERIODO}) M15: {rsi} ({rsi_interp})\n"
-            f"ATR({ATR_PERIODO}) M15: {atr}  [volatilidad por vela de 15 min]\n"
-            f"ATR diario estimado: ~{round(atr * M15_VELAS_POR_DIA, 4) if atr else 'N/A'}\n"
-            f"Perfil de Volumen (7 días, 40 niveles):\n"
+            f"ATR({ATR_PERIODO}) M15: {atr}\n"
+            f"Perfil de Volumen:\n"
             f"  POC (Point of Control): {perfil.get('poc', 'N/A')}\n"
             f"  VAH (Value Area High):  {perfil.get('vah', 'N/A')}\n"
             f"  VAL (Value Area Low):   {perfil.get('val', 'N/A')}\n"
@@ -456,7 +484,8 @@ def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
             bloque += f"  {c['datetime']}: O={c['open']} H={c['high']} L={c['low']} C={c['close']}\n"
 
         bloques_texto.append(bloque)
-        print(f"  ✅ {instrumento}: precio={precio_actual} | RSI={rsi} | velas={len(candles)}")
+        print(f"  ✅ {instrumento} ({simbolo_ok}): precio={precio_actual} | "
+              f"RSI={rsi} | POC={perfil.get('poc','?')} | velas={len(candles)}")
 
     return resumen_dict, "\n\n".join(bloques_texto)
 
@@ -605,18 +634,17 @@ def obtener_recomendaciones_ia(
         f"{analisis_tecnico_texto}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"INSTRUCCIONES:\n"
-        f"1. Sintetiza el contexto macro + técnico para cada instrumento.\n"
-        f"2. Los rangos de precios en tus recomendaciones DEBEN ser coherentes con los precios "
-        f"   actuales mostrados en la Capa 3 (precio actual y rango 7d). No inventes rangos.\n"
-        f"3. Usa los niveles HVN como soporte/resistencia clave y LVN como zonas de aceleración.\n"
-        f"4. El POC es el nivel de equilibrio; las operaciones se plantean desde VAH/VAL.\n\n"
-        f"Responde EXACTAMENTE con este formato (respeta los prefijos):\n\n"
-        f"SESGO: [sesgo semanal en una línea]\n\n"
-        f"XAUUSD: [recomendación con niveles reales de entrada, objetivo y stop loss]\n"
-        f"US30: [recomendación con niveles reales de entrada, objetivo y stop loss]\n"
-        f"NAS100: [recomendación con niveles reales de entrada, objetivo y stop loss]\n\n"
-        f"Máximo 3 oraciones por instrumento. Sé directo y accionable. "
-        f"Los precios DEBEN reflejar los valores reales del mercado actual."
+        f"1. Los rangos de precio DEBEN ser coherentes con los precios reales de la Capa 3.\n"
+        f"2. Usa HVN como soporte/resistencia, LVN como zonas de aceleración, POC como equilibrio.\n"
+        f"3. Máximo 3 oraciones por instrumento. Directo y accionable.\n\n"
+        f"FORMATO OBLIGATORIO — responde EXACTAMENTE así, sin texto adicional antes ni después:\n\n"
+        f"SESGO: <sesgo en una línea>\n"
+        f"---\n"
+        f"XAUUSD: <recomendación XAUUSD con entrada, objetivo y stop>\n"
+        f"---\n"
+        f"US30: <recomendación US30 con entrada, objetivo y stop>\n"
+        f"---\n"
+        f"NAS100: <recomendación NAS100 con entrada, objetivo y stop>\n"
     )
 
     try:
@@ -637,36 +665,45 @@ def obtener_recomendaciones_ia(
         )
 
         respuesta = message.content[0].text.strip()
-        lineas    = respuesta.split('\n')
 
-        # Extraer sesgo
-        sesgo_linea = next((l for l in lineas if l.upper().startswith('SESGO:')), None)
-        sesgo = sesgo_linea.split(':', 1)[1].strip() if sesgo_linea else "Ver recomendaciones abajo"
+        # Parsear usando '---' como delimitador de sección (más robusto que detectar prefijos)
+        sesgo   = "Ver recomendaciones abajo"
+        bloques = {'XAUUSD': [], 'US30': [], 'NAS100': []}
 
-        # Parsear bloques por instrumento
-        instrumentos = ['XAUUSD', 'US30', 'NAS100']
-        bloques = {k: [] for k in instrumentos}
-        clave_actual = None
-
-        for linea in lineas:
-            if linea.upper().startswith('SESGO:'):
+        secciones = respuesta.split('---')
+        for seccion in secciones:
+            seccion = seccion.strip()
+            if not seccion:
                 continue
-            for inst in instrumentos:
-                if linea.upper().startswith(inst + ':') or linea.upper().startswith(inst + ' '):
-                    clave_actual = inst
-                    break
-            if clave_actual:
-                bloques[clave_actual].append(linea.strip())
+            if seccion.upper().startswith('SESGO:'):
+                sesgo = seccion.split(':', 1)[1].strip()
+            elif seccion.upper().startswith('XAUUSD:'):
+                bloques['XAUUSD'] = [seccion.strip()]
+            elif seccion.upper().startswith('US30:'):
+                bloques['US30'] = [seccion.strip()]
+            elif seccion.upper().startswith('NAS100:'):
+                bloques['NAS100'] = [seccion.strip()]
 
-        # Fallback si el parseo falló
+        # Fallback: si el modelo no usó '---', parsear línea a línea con reset correcto
         if not any(bloques.values()):
-            recomendaciones_full = '\n'.join(
-                l for l in lineas if not l.upper().startswith('SESGO:') and l.strip()
-            ).strip()
-            mitad = len(recomendaciones_full) // 3
-            bloques['XAUUSD'] = [recomendaciones_full[:mitad]]
-            bloques['US30']   = [recomendaciones_full[mitad:2*mitad]]
-            bloques['NAS100'] = [recomendaciones_full[2*mitad:]]
+            instrumentos  = ['XAUUSD', 'US30', 'NAS100']
+            clave_actual  = None
+            lineas        = respuesta.split('\n')
+            for linea in lineas:
+                linea_up = linea.upper().strip()
+                if linea_up.startswith('SESGO:'):
+                    sesgo = linea.split(':', 1)[1].strip()
+                    clave_actual = None   # salir de cualquier bloque activo
+                    continue
+                matched = False
+                for inst in instrumentos:
+                    if linea_up.startswith(inst + ':') or linea_up.startswith(inst + ' '):
+                        clave_actual = inst
+                        bloques[clave_actual] = [linea.strip()]
+                        matched = True
+                        break
+                if not matched and clave_actual and linea.strip():
+                    bloques[clave_actual].append(linea.strip())
 
         # Color según sesgo
         sesgo_lower = sesgo.lower()
@@ -695,19 +732,21 @@ def obtener_recomendaciones_ia(
 #  ENVÍO A DISCORD
 # ════════════════════════════════════════════════════════════
 def formatear_campo_tecnico(instrumento: str, datos: dict) -> str:
-    """Genera un resumen compacto del análisis técnico M15 para Discord."""
+    """
+    Resumen de Capa 0 para Discord.
+    Muestra: precio, tendencia, POC/VAH/VAL, HVN, LVN.
+    RSI y ATR se omiten del display (siguen en el prompt de la IA).
+    """
     if 'error' in datos:
-        return datos['error']
-    pv  = datos.get('perfil_volumen', {})
-    hvn = ", ".join(str(p) for p in pv.get('hvn', [])) or "N/A"
-    lvn = ", ".join(str(p) for p in pv.get('lvn', [])) or "N/A"
+        return f"⚠️ {datos['error']}"
+    pv     = datos.get('perfil_volumen', {})
+    hvn    = ", ".join(str(p) for p in pv.get('hvn', [])) or "N/A"
+    lvn    = ", ".join(str(p) for p in pv.get('lvn', [])) or "N/A"
     fuente = datos.get('simbolo_fuente', '?')
     return (
-        f"💲 **{instrumento}** (via {fuente}) — Precio: **{datos['precio_actual']}** ({datos['cambio_7d_pct']:+.2f}% 7d) | Velas M15: {datos.get('num_velas','?')}\n"
-        f"📈 Tendencia (EMA{EMA_RAPIDA}/EMA{EMA_LENTA} M15): {datos['tendencia']}\n"
-        f"⚡ RSI({RSI_PERIODO}) M15: {datos['rsi']} — {datos['rsi_interp']}\n"
-        f"📏 ATR({ATR_PERIODO}) M15: {datos['atr_m15']}\n"
-        f"🗂️ POC: {pv.get('poc','N/A')} | VAH: {pv.get('vah','N/A')} | VAL: {pv.get('val','N/A')}\n"
+        f"💲 **{instrumento}** (via {fuente}) — **{datos['precio_actual']}** ({datos['cambio_7d_pct']:+.2f}% 7d) | {datos.get('num_velas','?')} velas M15\n"
+        f"📈 {datos['tendencia']}\n"
+        f"🗂️ POC: **{pv.get('poc','N/A')}** | VAH: {pv.get('vah','N/A')} | VAL: {pv.get('val','N/A')}\n"
         f"🟢 HVN: {hvn}\n"
         f"🔸 LVN: {lvn}"
     )[:1024]
@@ -806,13 +845,13 @@ def ejecutar_agente():
     ]
 
     payload = {
-        "content": "@everyone 🛰️ **Sentinel v2.5: Reporte Semanal de Inteligencia**",
+        "content": "@everyone 🛰️ **Sentinel v2.6: Reporte Semanal de Inteligencia**",
         "embeds": [{
             "title": f"🛡️ INTELIGENCIA DE MERCADO | {ahora} (Tijuana)",
             "color": color,
             "fields": fields,
             "footer": {
-                "text": "Sentinel v2.5 | Tijuana Local Time | Datos: NewsAPI + FinnHub + Twelve Data M15 | IA: Claude Sonnet"
+                "text": "Sentinel v2.6 | Tijuana Local Time | Datos: NewsAPI + FinnHub + Twelve Data M15 | IA: Claude Sonnet"
             }
         }]
     }
