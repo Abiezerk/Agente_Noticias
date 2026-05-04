@@ -630,18 +630,14 @@ def obtener_recomendaciones_ia(
 #  ENVÍO A DISCORD
 # ════════════════════════════════════════════════════════════
 def formatear_campo_tecnico(datos: dict) -> str:
-    """Resumen Capa 0 XAUUSD para Discord: POC, VAH, VAL, HVN, LVN."""
+    """Resumen Capa 0 XAUUSD para Discord: solo POC."""
     if 'error' in datos:
         return f"⚠️ {datos['error']}"
-    pv  = datos.get('perfil_volumen', {})
-    hvn = ", ".join(str(p) for p in pv.get('hvn', [])) or "N/A"
-    lvn = ", ".join(str(p) for p in pv.get('lvn', [])) or "N/A"
+    pv = datos.get('perfil_volumen', {})
     return (
         f"💲 **XAUUSD** — **{datos['precio_actual']}** ({datos['cambio_7d_pct']:+.2f}% 7d) | {datos.get('num_velas','?')} velas M15\n"
         f"📈 {datos['tendencia']}\n"
-        f"🗂️ POC: **{pv.get('poc','N/A')}** | VAH: {pv.get('vah','N/A')} | VAL: {pv.get('val','N/A')}\n"
-        f"🟢 HVN: {hvn}\n"
-        f"🔸 LVN: {lvn}"
+        f"🗂️ POC: **{pv.get('poc','N/A')}**"
     )[:1024]
 
 
