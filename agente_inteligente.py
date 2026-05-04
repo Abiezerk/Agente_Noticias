@@ -197,19 +197,54 @@ def calcular_atr(candles: list[dict], periodo: int = 14) -> float:
     return round(sum(trs[-periodo:]) / min(len(trs), periodo), 4)
 
 
-def calcular_perfil_volumen(candles: list[dict], num_niveles: int = None) -> dict:
+def calcular_perfil_volumen(candles: list[dict],
+                            tick: float = 1.0,
+                            num_niveles: int = None) -> dict:
+    """
+    Perfil de Volumen de Rango Fijo (Fixed Range Volume Profile).
+
+    Parámetros:
+        tick        — tamaño de cada bucket en unidades de precio.
+                      Para XAUUSD se usa $1.00 (resolución operativa real).
+                      Produce ~150-250 niveles para un rango semanal típico,
+                      igual a lo que muestra TradingView con el mismo ajuste.
+        num_niveles — si se pasa, ignora `tick` y usa ese número de buckets
+                      (útil para otros instrumentos).
+
+    El volumen de cada vela se distribuye proporcionalmente al overlap
+    entre la vela y cada bucket (igual al algoritmo TPO/volume profile estándar).
+
+    HVN — picos locales de volumen DENTRO del rango completo (no solo fuera del VA).
+           Un HVN es un bucket con más volumen que ambos vecinos.
+           Se filtran los 4 más significativos por volumen y se ordenan por precio.
+
+    LVN — valles locales con volumen > 0 DENTRO del rango completo.
+           Un LVN es un bucket con menos volumen que ambos vecinos Y
+           que está dentro del rango operativo del período
+           (precio_min + 5% del rango → precio_max - 5% del rango),
+           para excluir extremos espurios en los bordes del histograma.
+    """
     if not candles:
         return {}
+
     precio_min = min(c['low']  for c in candles)
     precio_max = max(c['high'] for c in candles)
     rango = precio_max - precio_min
     if rango == 0:
         return {}
 
-    if num_niveles is None:
-        num_niveles = max(20, min(60, int(len(candles) ** 0.5)))
+    # Alinear precio_min al tick más cercano por debajo
+    precio_base = (precio_min // tick) * tick
 
-    bucket_size = rango / num_niveles
+    if num_niveles is not None:
+        # Modo legacy: bucket_size calculado desde num_niveles
+        bucket_size = rango / num_niveles
+        precio_base = precio_min
+    else:
+        # Modo principal: bucket fijo de `tick` dólares
+        bucket_size = tick
+        num_niveles = int((precio_max - precio_base) / bucket_size) + 2
+
     buckets = [0.0] * num_niveles
 
     for c in candles:
@@ -218,11 +253,15 @@ def calcular_perfil_volumen(candles: list[dict], num_niveles: int = None) -> dic
             vol = 1.0
         vela_rango = c['high'] - c['low']
         if vela_rango == 0:
-            idx = min(int((c['close'] - precio_min) / bucket_size), num_niveles - 1)
-            buckets[idx] += vol
+            idx = min(int((c['close'] - precio_base) / bucket_size), num_niveles - 1)
+            if 0 <= idx < num_niveles:
+                buckets[idx] += vol
             continue
-        for b in range(num_niveles):
-            b_low  = precio_min + b * bucket_size
+        # Calcular rango de buckets que toca esta vela (optimización: no iterar todos)
+        b_ini = max(0, int((c['low']  - precio_base) / bucket_size))
+        b_fin = min(num_niveles - 1, int((c['high'] - precio_base) / bucket_size))
+        for b in range(b_ini, b_fin + 1):
+            b_low  = precio_base + b * bucket_size
             b_high = b_low + bucket_size
             overlap = max(0.0, min(c['high'], b_high) - max(c['low'], b_low))
             if overlap > 0:
@@ -232,9 +271,11 @@ def calcular_perfil_volumen(candles: list[dict], num_niveles: int = None) -> dic
     if vol_total == 0:
         return {}
 
+    # POC — bucket con mayor volumen acumulado
     poc_idx   = buckets.index(max(buckets))
-    poc_price = precio_min + (poc_idx + 0.5) * bucket_size
+    poc_price = precio_base + (poc_idx + 0.5) * bucket_size
 
+    # Value Area — 70% del volumen alrededor del POC (expansión bilateral)
     target = vol_total * 0.70
     acum   = buckets[poc_idx]
     lo, hi = poc_idx, poc_idx
@@ -247,31 +288,42 @@ def calcular_perfil_volumen(candles: list[dict], num_niveles: int = None) -> dic
             hi += 1; acum += buckets[hi]
         else:
             break
-    val_price = precio_min + (lo + 0.5) * bucket_size
-    vah_price = precio_min + (hi + 0.5) * bucket_size
+    val_price = precio_base + (lo + 0.5) * bucket_size
+    vah_price = precio_base + (hi + 0.5) * bucket_size
 
-    hvn_precios = []
-    for i in range(1, num_niveles - 1):
-        if (i < lo or i > hi) and buckets[i] > buckets[i-1] and buckets[i] > buckets[i+1]:
-            hvn_precios.append((buckets[i], precio_min + (i + 0.5) * bucket_size))
-    hvn_precios.sort(reverse=True)
-    hvn_prices = sorted([p for _, p in hvn_precios[:4]])
+    # Margen operativo: excluir el 5% inferior y superior del rango
+    # para evitar LVN/HVN espurios en los extremos del histograma
+    margen     = int(num_niveles * 0.05)
+    b_interior = range(max(1, margen), min(num_niveles - 1, num_niveles - margen))
 
-    lvn_precios = []
-    for i in range(1, num_niveles - 1):
+    # HVN — picos locales en todo el rango interior (máximo local vs ambos vecinos)
+    hvn_candidatos = []
+    for i in b_interior:
+        if buckets[i] > buckets[i-1] and buckets[i] > buckets[i+1]:
+            hvn_candidatos.append((buckets[i], precio_base + (i + 0.5) * bucket_size))
+    hvn_candidatos.sort(reverse=True)
+    # Tomar los 4 HVN más voluminosos y ordenarlos por precio
+    hvn_prices = sorted([p for _, p in hvn_candidatos[:4]])
+
+    # LVN — valles locales en el rango interior con volumen > 0
+    lvn_candidatos = []
+    for i in b_interior:
         if buckets[i] > 0 and buckets[i] < buckets[i-1] and buckets[i] < buckets[i+1]:
-            lvn_precios.append((buckets[i], precio_min + (i + 0.5) * bucket_size))
-    lvn_precios.sort()
-    lvn_prices = sorted([p for _, p in lvn_precios[:4]])
+            lvn_candidatos.append((buckets[i], precio_base + (i + 0.5) * bucket_size))
+    lvn_candidatos.sort()
+    # Tomar los 4 LVN menos voluminosos (vacíos de liquidez más profundos) ordenados por precio
+    lvn_prices = sorted([p for _, p in lvn_candidatos[:4]])
 
     return {
-        'poc':       round(poc_price, 4),
-        'vah':       round(vah_price, 4),
-        'val':       round(val_price, 4),
-        'hvn':       [round(p, 4) for p in hvn_prices],
-        'lvn':       [round(p, 4) for p in lvn_prices],
-        'rango_min': round(precio_min, 4),
-        'rango_max': round(precio_max, 4),
+        'poc':        round(poc_price, 2),
+        'vah':        round(vah_price, 2),
+        'val':        round(val_price, 2),
+        'hvn':        [round(p, 2) for p in hvn_prices],
+        'lvn':        [round(p, 2) for p in lvn_prices],
+        'rango_min':  round(precio_min, 2),
+        'rango_max':  round(precio_max, 2),
+        'bucket_size': bucket_size,
+        'num_niveles': num_niveles,
     }
 
 
@@ -335,7 +387,8 @@ def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
         tendencia = analizar_tendencia(candles)
         rsi       = calcular_rsi(closes, RSI_PERIODO)
         atr       = calcular_atr(candles, ATR_PERIODO)
-        perfil    = calcular_perfil_volumen(candles)
+        # Perfil de Volumen de Rango Fijo: bucket de $1 por nivel (resolución operativa XAUUSD)
+        perfil    = calcular_perfil_volumen(candles, tick=1.0)
 
         if rsi is not None:
             if rsi > 70:   rsi_interp = "sobrecomprado"
@@ -381,7 +434,8 @@ def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
             bloque += f"  {c['datetime']}: O={c['open']} H={c['high']} L={c['low']} C={c['close']}\n"
 
         bloques_texto.append(bloque)
-        print(f"  ✅ {instrumento}: precio={precio_actual} | RSI={rsi} | POC={perfil.get('poc','?')} | velas={len(candles)}")
+        print(f"  ✅ {instrumento}: precio={precio_actual} | RSI={rsi} | "
+              f"POC={perfil.get('poc','?')} | buckets=${perfil.get('bucket_size','?')} × {perfil.get('num_niveles','?')} | velas={len(candles)}")
 
     return resumen_dict, "\n\n".join(bloques_texto)
 
