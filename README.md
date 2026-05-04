@@ -7,7 +7,7 @@ Envia un reporte diario de XAUUSD (Oro) a tu servidor de Discord con:
 - Calendario economico de alto impacto
 - Sesgo semanal y recomendacion de trade generada por Claude AI
 
-Se ejecuta automaticamente de lunes a domingo a las 6:00 AM Tijuana (13:00 UTC)
+Se ejecuta automaticamente de lunes a domingo a las 4:00 AM Tijuana (11:00 UTC)
 usando GitHub Actions. No necesitas servidor propio.
 
 
