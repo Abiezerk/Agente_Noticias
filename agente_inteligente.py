@@ -7,30 +7,37 @@ from datetime import datetime, timedelta
 TIJUANA_TZ = pytz.timezone('America/Tijuana')
 
 # ─────────────────────────────────────────────────────────────
-# Mapeo de símbolos internos → símbolo Finnhub (candles M15)
-# Finnhub usa símbolos de futuros/CFDs para índices:
-#   XAUUSD  → OANDA:XAU_USD  (oro spot)
-#   US30    → OANDA:US30_USD (Dow Jones CFD via OANDA)
-#   NAS100  → OANDA:NAS100_USD
+# Mapeo de símbolos internos → símbolo Twelve Data (candles M15)
+# Twelve Data soporta estos símbolos nativamente en plan gratuito:
+#   XAUUSD  → XAU/USD   (oro spot forex)
+#   US30    → DJIA      (Dow Jones, requiere plan Basic+)
+#             alternativa ETF: DIA (SPDR Dow Jones ETF, NYSE)
+#   NAS100  → NDX       (Nasdaq 100 index)
+#             alternativa ETF: QQQ (Invesco QQQ ETF, NASDAQ)
 #
 # Temporalidad: M15 (resolución 15 minutos)
-# Rango: 7 días → ~672 velas (7d × 24h × 4 velas/h)
+# Rango: 7 días → ~480 velas reales (excluye fines de semana)
+#   Forex XAU/USD: ~96 velas/día (24h) → ~480 en 5 días hábiles
+#   Índices/ETFs:  ~26 velas/día (6.5h mercado USA) → ~130 en 5 días
 # EMAs, RSI y ATR calculados sobre cierres de 15 minutos.
 # ─────────────────────────────────────────────────────────────
 
-# Velas M15 en 7 días de mercado (forex opera ~24h, índices ~23h)
-M15_VELAS_POR_DIA  = 96   # 24h × 4 velas/h
+# Constantes de temporalidad M15
+M15_VELAS_POR_DIA  = 96   # máximo forex (24h × 4); índices usan menos (~26/día)
 M15_DIAS           = 7
-M15_TOTAL_VELAS    = M15_VELAS_POR_DIA * M15_DIAS  # ~672
+M15_TOTAL_VELAS    = M15_VELAS_POR_DIA * M15_DIAS  # techo, la API devuelve las reales
 # Períodos de indicadores en unidades de velas M15
 EMA_RAPIDA         = 50   # ≈ 12.5h  (equivalente a EMA12 en H4)
 EMA_LENTA          = 200  # ≈ 50h    (equivalente a EMA50 en H4)
-RSI_PERIODO        = 14   # estándar, sobre cierres M15
+RSI_PERIODO        = 14   # estándar Wilder, sobre cierres M15
 ATR_PERIODO        = 14   # estándar, sobre rangos verdaderos M15
-FINNHUB_SYMBOLS = {
-    "XAUUSD":  "OANDA:XAU_USD",
-    "US30":    "OANDA:US30_USD",
-    "NAS100":  "OANDA:NAS100_USD",
+
+# Twelve Data: símbolo principal y tipo de instrumento
+# type: 'forex' usa /time_series directo; 'etf'/'stock' también usa /time_series
+TWELVE_DATA_SYMBOLS = {
+    "XAUUSD": {"symbol": "XAU/USD",  "tipo": "forex"},
+    "US30":   {"symbol": "DIA",      "tipo": "etf"},    # SPDR Dow Jones ETF (proxy US30)
+    "NAS100": {"symbol": "QQQ",      "tipo": "etf"},    # Invesco QQQ ETF (proxy NAS100)
 }
 
 
@@ -57,54 +64,82 @@ def calcular_ventanas():
 # ════════════════════════════════════════════════════════════
 #  CAPA 0 — PRECIOS Y ANÁLISIS TÉCNICO + PERFIL DE VOLUMEN
 # ════════════════════════════════════════════════════════════
-def obtener_candles_finnhub(simbolo_finnhub: str, dias: int = M15_DIAS) -> list[dict]:
+def obtener_candles_twelvedata(simbolo: str, tipo: str, dias: int = M15_DIAS) -> list[dict]:
     """
-    Descarga velas M15 de los últimos `dias` días desde Finnhub.
-    Resolución: 15 minutos → ~96 velas/día → ~672 velas en 7 días.
-    Retorna lista de dicts con keys: datetime, open, high, low, close, volume.
+    Descarga velas M15 de los últimos `dias` días desde Twelve Data.
+    Endpoint: /time_series?interval=15min&outputsize=N
+    Plan gratuito: 8 req/min, 800 req/día.
+
+    Twelve Data devuelve las velas en orden DESCENDENTE (más reciente primero).
+    Esta función las invierte para dejarlas en orden cronológico ascendente.
+
+    Retorna lista de dicts: datetime, open, high, low, close, volume.
     """
-    api_key = os.getenv('FINNHUB_API_KEY')
+    api_key = os.getenv('TWELVE_DATA_API_KEY')
     if not api_key:
+        print(f"  ⚠️  TWELVE_DATA_API_KEY no configurada")
         return []
 
-    ahora = int(datetime.now().timestamp())
-    # +2 días extra para absorber fines de semana y huecos de mercado
-    desde = int((datetime.now() - timedelta(days=dias + 2)).timestamp())
+    # Twelve Data usa outputsize para limitar cantidad de velas.
+    # Pedimos el máximo razonable para cubrir 7 días:
+    #   Forex: ~96 velas/día × 7 = 672 (pedimos 700 con margen)
+    #   ETFs:  ~26 velas/día × 7 = 182 (pedimos 200 con margen)
+    outputsize = 700 if tipo == 'forex' else 200
+
+    # Para ETFs/stocks necesitamos especificar exchange para obtener M15 extendido
+    exchange_param = ""
+    if tipo == 'etf':
+        exchange_param = "&exchange=NASDAQ"
 
     url = (
-        f"https://finnhub.io/api/v1/forex/candle"
-        f"?symbol={simbolo_finnhub}&resolution=15"
-        f"&from={desde}&to={ahora}&token={api_key}"
+        f"https://api.twelvedata.com/time_series"
+        f"?symbol={simbolo}"
+        f"&interval=15min"
+        f"&outputsize={outputsize}"
+        f"&timezone=UTC"
+        f"{exchange_param}"
+        f"&apikey={api_key}"
     )
 
     try:
         res = requests.get(url, timeout=30)
         res.raise_for_status()
         data = res.json()
-        if data.get('s') != 'ok':
-            print(f"  ⚠️  Finnhub status={data.get('s')} para {simbolo_finnhub}")
+
+        # Twelve Data retorna {"status": "error", "message": "..."} en errores
+        if data.get('status') == 'error':
+            print(f"  ⚠️  Twelve Data error para {simbolo}: {data.get('message', 'desconocido')}")
             return []
 
+        valores = data.get('values', [])
+        if not valores:
+            print(f"  ⚠️  Twelve Data: sin valores para {simbolo}")
+            return []
+
+        # Convertir y filtrar al rango de días solicitado
+        fecha_limite = datetime.utcnow() - timedelta(days=dias)
         candles = []
-        vol_lista = data.get('v', [0] * len(data['c']))
-        for i in range(len(data['c'])):
+        for v in reversed(valores):          # invertir: Twelve Data viene desc → asc
+            try:
+                dt = datetime.strptime(v['datetime'], '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                dt = datetime.strptime(v['datetime'], '%Y-%m-%d')
+            if dt < fecha_limite:
+                continue
             candles.append({
-                'datetime': datetime.utcfromtimestamp(data['t'][i]).strftime('%Y-%m-%d %H:%M'),
-                'open':     data['o'][i],
-                'high':     data['h'][i],
-                'low':      data['l'][i],
-                'close':    data['c'][i],
-                'volume':   vol_lista[i] if i < len(vol_lista) else 0,
+                'datetime': v['datetime'],
+                'open':     float(v['open']),
+                'high':     float(v['high']),
+                'low':      float(v['low']),
+                'close':    float(v['close']),
+                'volume':   float(v.get('volume', 0) or 0),
             })
 
-        # Recortar a exactamente los últimos N días de velas disponibles
-        max_velas = dias * M15_VELAS_POR_DIA
-        resultado = candles[-max_velas:] if len(candles) > max_velas else candles
-        print(f"  📥 {simbolo_finnhub}: {len(resultado)} velas M15 descargadas")
-        return resultado
+        print(f"  📥 {simbolo} ({tipo}): {len(candles)} velas M15 descargadas")
+        return candles
 
     except Exception as e:
-        print(f"  ❌ Error obteniendo candles M15 {simbolo_finnhub}: {e}")
+        print(f"  ❌ Error obteniendo candles M15 Twelve Data {simbolo}: {e}")
         return []
 
 
@@ -264,25 +299,28 @@ def analizar_tendencia(candles: list[dict]) -> str:
 
 def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
     """
-    Obtiene y analiza ~672 velas M15 (7 días) de cada instrumento.
+    Obtiene y analiza velas M15 (7 días) de cada instrumento via Twelve Data.
     Indicadores calculados en temporalidad M15:
       - EMA50 y EMA200 para tendencia
       - RSI(14) sobre cierres M15
       - ATR(14) sobre rangos verdaderos M15
       - Perfil de Volumen completo (POC, VAH, VAL, HVN, LVN)
     """
-    api_key = os.getenv('FINNHUB_API_KEY')
+    api_key = os.getenv('TWELVE_DATA_API_KEY')
     if not api_key:
-        return {}, "FINNHUB_API_KEY no configurada – análisis técnico no disponible."
+        return {}, "TWELVE_DATA_API_KEY no configurada – análisis técnico no disponible."
 
     resumen_dict = {}
     bloques_texto = []
 
-    for instrumento, simbolo in FINNHUB_SYMBOLS.items():
-        candles = obtener_candles_finnhub(simbolo, dias=M15_DIAS)
+    for instrumento, cfg in TWELVE_DATA_SYMBOLS.items():
+        simbolo = cfg['symbol']
+        tipo    = cfg['tipo']
+
+        candles = obtener_candles_twelvedata(simbolo, tipo, dias=M15_DIAS)
         if not candles:
-            resumen_dict[instrumento] = {'error': 'Sin datos de precio'}
-            bloques_texto.append(f"{instrumento}: Sin datos disponibles desde Finnhub ({simbolo}).")
+            resumen_dict[instrumento] = {'error': f'Sin datos de precio ({simbolo})'}
+            bloques_texto.append(f"{instrumento}: Sin datos disponibles desde Twelve Data ({simbolo}).")
             continue
 
         closes        = [c['close'] for c in candles]
@@ -293,59 +331,56 @@ def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
         tendencia = analizar_tendencia(candles)
         rsi       = calcular_rsi(closes, RSI_PERIODO)
         atr       = calcular_atr(candles, ATR_PERIODO)
-        perfil    = calcular_perfil_volumen(candles, num_niveles=40)  # más resolución con ~672 velas
+        perfil    = calcular_perfil_volumen(candles, num_niveles=40)
 
         # Interpretación RSI
         if rsi is not None:
-            if rsi > 70:
-                rsi_interp = "sobrecomprado"
-            elif rsi < 30:
-                rsi_interp = "sobrevendido"
-            else:
-                rsi_interp = "neutral"
+            if rsi > 70:   rsi_interp = "sobrecomprado"
+            elif rsi < 30: rsi_interp = "sobrevendido"
+            else:          rsi_interp = "neutral"
         else:
             rsi_interp = "N/A"
 
         resumen_dict[instrumento] = {
-            'precio_actual': precio_actual,
-            'cambio_7d_pct': cambio_pct,
-            'tendencia':     tendencia,
-            'rsi':           rsi,
-            'rsi_interp':    rsi_interp,
-            'atr_m15':       atr,
+            'simbolo_fuente': simbolo,
+            'precio_actual':  precio_actual,
+            'cambio_7d_pct':  cambio_pct,
+            'tendencia':      tendencia,
+            'rsi':            rsi,
+            'rsi_interp':     rsi_interp,
+            'atr_m15':        atr,
             'perfil_volumen': perfil,
-            'num_velas':     len(candles),
+            'num_velas':      len(candles),
         }
 
-        # Texto legible para el prompt de IA
+        # Texto para el prompt de Claude
         hvn_str = ", ".join(str(p) for p in perfil.get('hvn', [])) or "N/A"
         lvn_str = ", ".join(str(p) for p in perfil.get('lvn', [])) or "N/A"
-        # Solo mostrar las últimas 8 velas en el prompt para no saturar el contexto
         muestra_velas = candles[-8:]
 
         bloque = (
             f"=== {instrumento} ({simbolo}) — Temporalidad M15 ===\n"
-            f"Velas procesadas: {len(candles)} velas M15 ({M15_DIAS} días)\n"
+            f"Fuente: Twelve Data | Velas procesadas: {len(candles)} M15 ({M15_DIAS} días)\n"
             f"Rango 7d: {perfil.get('rango_min', 'N/A')} – {perfil.get('rango_max', 'N/A')}\n"
             f"Precio actual (último cierre M15): {precio_actual}\n"
             f"Cambio 7d: {cambio_pct:+.2f}%\n"
             f"Tendencia (EMA{EMA_RAPIDA}/EMA{EMA_LENTA} en M15): {tendencia}\n"
             f"RSI({RSI_PERIODO}) M15: {rsi} ({rsi_interp})\n"
             f"ATR({ATR_PERIODO}) M15: {atr}  [volatilidad por vela de 15 min]\n"
-            f"ATR diario estimado (×{M15_VELAS_POR_DIA} velas/día): ~{round(atr * M15_VELAS_POR_DIA, 4) if atr else 'N/A'}\n"
+            f"ATR diario estimado: ~{round(atr * M15_VELAS_POR_DIA, 4) if atr else 'N/A'}\n"
             f"Perfil de Volumen (7 días, 40 niveles):\n"
             f"  POC (Point of Control): {perfil.get('poc', 'N/A')}\n"
             f"  VAH (Value Area High):  {perfil.get('vah', 'N/A')}\n"
             f"  VAL (Value Area Low):   {perfil.get('val', 'N/A')}\n"
             f"  HVN (soporte/resistencia fuerte): {hvn_str}\n"
             f"  LVN (zona de baja liquidez):      {lvn_str}\n"
-            f"Últimas 8 velas M15 (muestra):\n"
+            f"Últimas 8 velas M15:\n"
         )
         for c in muestra_velas:
             bloque += f"  {c['datetime']}: O={c['open']} H={c['high']} L={c['low']} C={c['close']}\n"
 
         bloques_texto.append(bloque)
-        print(f"  ✅ {instrumento}: precio={precio_actual} | tendencia={tendencia} | RSI({RSI_PERIODO})={rsi} | velas={len(candles)}")
+        print(f"  ✅ {instrumento}: precio={precio_actual} | RSI={rsi} | velas={len(candles)}")
 
     return resumen_dict, "\n\n".join(bloques_texto)
 
@@ -587,11 +622,12 @@ def formatear_campo_tecnico(instrumento: str, datos: dict) -> str:
     """Genera un resumen compacto del análisis técnico M15 para Discord."""
     if 'error' in datos:
         return datos['error']
-    pv = datos.get('perfil_volumen', {})
+    pv  = datos.get('perfil_volumen', {})
     hvn = ", ".join(str(p) for p in pv.get('hvn', [])) or "N/A"
     lvn = ", ".join(str(p) for p in pv.get('lvn', [])) or "N/A"
+    fuente = datos.get('simbolo_fuente', '?')
     return (
-        f"💲 Precio: **{datos['precio_actual']}** ({datos['cambio_7d_pct']:+.2f}% 7d) | Velas M15: {datos.get('num_velas','?')}\n"
+        f"💲 **{instrumento}** (via {fuente}) — Precio: **{datos['precio_actual']}** ({datos['cambio_7d_pct']:+.2f}% 7d) | Velas M15: {datos.get('num_velas','?')}\n"
         f"📈 Tendencia (EMA{EMA_RAPIDA}/EMA{EMA_LENTA} M15): {datos['tendencia']}\n"
         f"⚡ RSI({RSI_PERIODO}) M15: {datos['rsi']} — {datos['rsi_interp']}\n"
         f"📏 ATR({ATR_PERIODO}) M15: {datos['atr_m15']}\n"
@@ -684,13 +720,13 @@ def ejecutar_agente():
     ]
 
     payload = {
-        "content": "@everyone 🛰️ **Sentinel v2.4: Reporte Semanal de Inteligencia**",
+        "content": "@everyone 🛰️ **Sentinel v2.5: Reporte Semanal de Inteligencia**",
         "embeds": [{
             "title": f"🛡️ INTELIGENCIA DE MERCADO | {ahora} (Tijuana)",
             "color": color,
             "fields": fields,
             "footer": {
-                "text": "Sentinel v2.4 | Tijuana Local Time | Datos: NewsAPI + FinnHub OANDA M15 | IA: Claude Sonnet"
+                "text": "Sentinel v2.5 | Tijuana Local Time | Datos: NewsAPI + FinnHub + Twelve Data M15 | IA: Claude Sonnet"
             }
         }]
     }
