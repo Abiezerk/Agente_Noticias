@@ -7,49 +7,159 @@ from datetime import datetime, timedelta
 TIJUANA_TZ = pytz.timezone('America/Tijuana')
 
 # ─────────────────────────────────────────────────────────────
-# Mapeo de símbolos internos → símbolo Twelve Data (candles M15)
-# Twelve Data soporta estos símbolos nativamente en plan gratuito:
-#   XAUUSD  → XAU/USD   (oro spot forex)
-#   US30    → DJIA      (Dow Jones, requiere plan Basic+)
-#             alternativa ETF: DIA (SPDR Dow Jones ETF, NYSE)
-#   NAS100  → NDX       (Nasdaq 100 index)
-#             alternativa ETF: QQQ (Invesco QQQ ETF, NASDAQ)
+# Fuente de precios: MetaTrader 5 (Pepperstone) — conexión local
+# Requiere que MT5 de Pepperstone esté abierto en la misma máquina.
+# Sin APIs externas, sin tokens, sin límites de rate.
+# Los precios son exactamente los del feed de tu broker.
 #
-# Temporalidad: M15 (resolución 15 minutos)
-# Rango: 7 días → ~480 velas reales (excluye fines de semana)
-#   Forex XAU/USD: ~96 velas/día (24h) → ~480 en 5 días hábiles
-#   Índices/ETFs:  ~26 velas/día (6.5h mercado USA) → ~130 en 5 días
-# EMAs, RSI y ATR calculados sobre cierres de 15 minutos.
+# Dependencia: pip install MetaTrader5
+# Símbolos: exactamente como aparecen en el Market Watch de MT5.
+# Verificar en MT5: Ver → Símbolos → buscar el nombre exacto.
 # ─────────────────────────────────────────────────────────────
 
 # Constantes de temporalidad M15
-M15_VELAS_POR_DIA  = 96   # máximo forex (24h × 4); índices usan menos (~26/día)
+M15_VELAS_POR_DIA  = 96   # forex 24h × 4; índices CFD ~23h en Pepperstone
 M15_DIAS           = 7
-M15_TOTAL_VELAS    = M15_VELAS_POR_DIA * M15_DIAS  # techo, la API devuelve las reales
 # Períodos de indicadores en unidades de velas M15
-EMA_RAPIDA         = 50   # ≈ 12.5h  (equivalente a EMA12 en H4)
-EMA_LENTA          = 200  # ≈ 50h    (equivalente a EMA50 en H4)
-RSI_PERIODO        = 14   # estándar Wilder, sobre cierres M15
-ATR_PERIODO        = 14   # estándar, sobre rangos verdaderos M15
+EMA_RAPIDA         = 50   # ≈ 12.5h
+EMA_LENTA          = 200  # ≈ 50h
+RSI_PERIODO        = 14
+ATR_PERIODO        = 14
 
-# Twelve Data: símbolo principal y tipo de instrumento
-# Cada instrumento tiene una lista de símbolos a intentar en orden.
-# Si el primero falla (plan/mercado), se intenta el siguiente automáticamente.
-TWELVE_DATA_SYMBOLS = {
-    "XAUUSD": {
-        "candidatos": [("XAU/USD", "forex")],
-        # Oro spot forex — funciona en todos los planes
-    },
-    "US30": {
-        "candidatos": [("DJIA", "index"), ("DIA", "etf")],
-        # DJIA = índice real ~42,000 | DIA = ETF proxy ~420 (fallback)
-    },
-    "NAS100": {
-        "candidatos": [("QQQ", "etf"), ("IXIC", "index"), ("NDX", "index")],
-        # QQQ funciona más consistentemente en Twelve Data plan gratuito
-        # NDX/IXIC como fallback si QQQ falla
-    },
+# Símbolos exactamente como aparecen en el Market Watch de MT5/Pepperstone.
+# Si alguno no funciona, abre MT5 → Ver → Símbolos y busca el nombre exacto.
+MT5_SYMBOLS = {
+    "XAUUSD": "XAUUSD",   # Oro spot
+    "US30":   "US30",     # Dow Jones CFD  (~42,000-49,000 pts en Pepperstone)
+    "NAS100": "NAS100",   # Nasdaq 100 CFD (~19,000-21,000 pts en Pepperstone)
 }
+
+
+# ════════════════════════════════════════════════════════════
+#  CAPA 0 — PRECIOS VIA MetaTrader 5 (PEPPERSTONE LOCAL)
+# ════════════════════════════════════════════════════════════
+def _mt5_importar():
+    """
+    Importa MetaTrader5 y retorna el módulo, o None con mensaje de error.
+    Separado para dar un error claro si el paquete no está instalado.
+    """
+    try:
+        import MetaTrader5 as mt5
+        return mt5
+    except ImportError:
+        print("  ❌ Paquete MetaTrader5 no instalado.")
+        print("     Ejecuta: pip install MetaTrader5")
+        return None
+
+
+def diagnosticar_mt5() -> str:
+    """
+    Verifica que MT5 esté instalado, abierto y conectado.
+    Retorna 'ok' o mensaje de error descriptivo.
+    """
+    mt5 = _mt5_importar()
+    if mt5 is None:
+        return "Paquete MetaTrader5 no instalado. Ejecuta: pip install MetaTrader5"
+
+    if not mt5.initialize():
+        err = mt5.last_error()
+        return (
+            f"MT5 no pudo inicializarse (código {err[0]}: {err[1]}). "
+            "Asegúrate de que MetaTrader 5 de Pepperstone esté abierto y con sesión activa."
+        )
+
+    info = mt5.terminal_info()
+    if info is None:
+        mt5.shutdown()
+        return "MT5 inicializado pero no se pudo obtener terminal_info."
+
+    cuenta = mt5.account_info()
+    broker  = cuenta.company if cuenta else "desconocido"
+    server  = cuenta.server  if cuenta else "desconocido"
+    balance = cuenta.balance if cuenta else 0
+    print(f"  🖥️  MT5 OK — broker={broker} | server={server} | balance={balance:.2f}")
+    # No llamar mt5.shutdown() aquí — se reutiliza la conexión en las llamadas siguientes
+    return 'ok'
+
+
+def obtener_candles_mt5(nombre_simbolo: str, dias: int = M15_DIAS) -> list[dict]:
+    """
+    Descarga velas M15 de los últimos `dias` días desde MetaTrader 5.
+    MT5 debe estar abierto en la misma máquina con sesión de Pepperstone activa.
+
+    Usa mt5.copy_rates_range() para obtener exactamente el rango de fechas.
+    Los precios son los del feed real de Pepperstone — idénticos a los que ves en la plataforma.
+
+    Retorna lista de dicts: datetime, open, high, low, close, volume (cronológico asc).
+    """
+    mt5 = _mt5_importar()
+    if mt5 is None:
+        return []
+
+    if not mt5.initialize():
+        err = mt5.last_error()
+        print(f"  ❌ {nombre_simbolo}: MT5 no inicializado — {err}")
+        return []
+
+    try:
+        # Verificar que el símbolo existe y está disponible
+        info = mt5.symbol_info(nombre_simbolo)
+        if info is None:
+            print(f"  ⚠️  {nombre_simbolo}: símbolo no encontrado en MT5.")
+            # Intentar activarlo en Market Watch y reintentar
+            mt5.symbol_select(nombre_simbolo, True)
+            info = mt5.symbol_info(nombre_simbolo)
+            if info is None:
+                # Sugerir nombres alternativos buscando coincidencias parciales
+                todos = [s.name for s in mt5.symbols_get() or [] if nombre_simbolo[:4] in s.name.upper()]
+                print(f"     Símbolos similares disponibles: {todos[:8]}")
+                return []
+
+        if not info.visible:
+            mt5.symbol_select(nombre_simbolo, True)
+
+        # Rango de fechas: desde hace `dias` días hasta ahora (UTC)
+        fecha_fin   = datetime.utcnow()
+        fecha_ini   = fecha_fin - timedelta(days=dias + 2)  # +2 para fines de semana
+
+        # TIMEFRAME_M15 = 15 minutos
+        TIMEFRAME_M15 = mt5.TIMEFRAME_M15
+
+        rates = mt5.copy_rates_range(nombre_simbolo, TIMEFRAME_M15, fecha_ini, fecha_fin)
+
+        if rates is None or len(rates) == 0:
+            err = mt5.last_error()
+            print(f"  ⚠️  {nombre_simbolo}: sin datos de MT5 — {err}")
+            return []
+
+        # Filtrar al rango exacto solicitado (excluir el buffer de +2 días)
+        fecha_limite = datetime.utcnow() - timedelta(days=dias)
+        candles = []
+        for r in rates:
+            dt = datetime.utcfromtimestamp(r['time'])
+            if dt < fecha_limite:
+                continue
+            candles.append({
+                'datetime': dt.strftime('%Y-%m-%d %H:%M:%S'),
+                'open':     float(r['open']),
+                'high':     float(r['high']),
+                'low':      float(r['low']),
+                'close':    float(r['close']),
+                'volume':   float(r['tick_volume']),  # tick volume de MT5
+            })
+
+        # MT5 devuelve cronológico ascendente — no hace falta invertir
+        print(f"  📥 {nombre_simbolo}: {len(candles)} velas M15 | "
+              f"{candles[0]['datetime']} → {candles[-1]['datetime']}")
+        return candles
+
+    except Exception as e:
+        print(f"  ❌ {nombre_simbolo}: error inesperado — {type(e).__name__}: {e}")
+        return []
+    finally:
+        # shutdown() cierra la conexión — solo llamar al terminar todas las solicitudes
+        # Se llama en obtener_analisis_tecnico_instrumentos después del loop
+        pass
 
 
 # ════════════════════════════════════════════════════════════
@@ -73,155 +183,8 @@ def calcular_ventanas():
 
 
 # ════════════════════════════════════════════════════════════
-#  CAPA 0 — PRECIOS Y ANÁLISIS TÉCNICO + PERFIL DE VOLUMEN
+#  INDICADORES TÉCNICOS
 # ════════════════════════════════════════════════════════════
-def diagnosticar_twelve_data() -> str:
-    """
-    Verifica conectividad y autenticación con Twelve Data antes de pedir datos.
-    Retorna: 'ok' | mensaje de error descriptivo.
-    """
-    api_key = os.getenv('TWELVE_DATA_API_KEY')
-    if not api_key:
-        return "TWELVE_DATA_API_KEY no está definida en las variables de entorno."
-
-    try:
-        # /api_usage es el endpoint más liviano — 0 créditos, solo verifica auth
-        r = requests.get(
-            f"https://api.twelvedata.com/api_usage?apikey={api_key}",
-            timeout=10
-        )
-        if r.status_code == 403:
-            body = r.text[:120]
-            return f"HTTP 403 — posible bloqueo de red o dominio no permitido. Body: {body}"
-        if r.status_code == 401:
-            return "HTTP 401 — API key inválida o expirada."
-        if r.status_code != 200:
-            return f"HTTP {r.status_code} inesperado. Body: {r.text[:120]}"
-
-        data = r.json()
-        if data.get('status') == 'error':
-            return f"Twelve Data error: {data.get('message', 'desconocido')}"
-
-        plan = data.get('plan', '?')
-        usado = data.get('current_usage', '?')
-        limite = data.get('daily_limit', '?')
-        print(f"  🔑 Twelve Data OK — plan={plan} | uso hoy={usado}/{limite}")
-        return 'ok'
-
-    except requests.exceptions.ConnectionError as e:
-        return f"Error de conexión — no se puede alcanzar api.twelvedata.com: {e}"
-    except Exception as e:
-        return f"Error inesperado en diagnóstico: {type(e).__name__}: {e}"
-
-
-def obtener_candles_twelvedata(simbolo: str, tipo: str, dias: int = M15_DIAS) -> list[dict]:
-    """
-    Descarga velas M15 de los últimos `dias` días desde Twelve Data.
-    Endpoint: /time_series?interval=15min&outputsize=N
-    Plan gratuito: 8 req/min, 800 req/día.
-
-    Twelve Data devuelve las velas en orden DESCENDENTE (más reciente primero).
-    Esta función las invierte para dejarlas en orden cronológico ascendente.
-
-    Retorna lista de dicts: datetime, open, high, low, close, volume.
-    """
-    api_key = os.getenv('TWELVE_DATA_API_KEY')
-    if not api_key:
-        print(f"  ⚠️  TWELVE_DATA_API_KEY no configurada")
-        return []
-
-    # outputsize por tipo:
-    #   forex (XAU/USD): opera 24h → ~96 velas/día × 7 = 672 → pedimos 700
-    #   index/etf (DJIA, QQQ): opera ~6.5h/día → ~26 velas/día × 7 ≈ 200 → pedimos 250
-    outputsize = 700 if tipo == 'forex' else 250
-
-    # exchange_param: ninguno para forex/index; NASDAQ solo para ETFs de NASDAQ
-    exchange_param = ""
-
-    url = (
-        f"https://api.twelvedata.com/time_series"
-        f"?symbol={simbolo}"
-        f"&interval=15min"
-        f"&outputsize={outputsize}"
-        f"&timezone=UTC"
-        f"{exchange_param}"
-        f"&apikey={api_key}"
-    )
-
-    try:
-        res = requests.get(url, timeout=30)
-
-        # Detectar bloqueo de red antes de intentar parsear JSON
-        if res.status_code == 403 and 'allowlist' in res.text.lower():
-            print(f"  🚫 {simbolo}: dominio api.twelvedata.com bloqueado por el proxy de red.")
-            print(f"     Solución: agrega 'api.twelvedata.com' a la allowlist de red del servidor.")
-            return []
-
-        if res.status_code == 401:
-            print(f"  🔑 {simbolo}: API key de Twelve Data inválida o expirada.")
-            return []
-
-        res.raise_for_status()
-        data = res.json()
-
-        # Twelve Data retorna {"status": "error", "message": "..."} en errores de negocio
-        if data.get('status') == 'error':
-            codigo = data.get('code', '?')
-            msg    = data.get('message', 'desconocido')
-            print(f"  ⚠️  Twelve Data [{simbolo}] error {codigo}: {msg}")
-            # Código 400 = símbolo no encontrado, 429 = rate limit
-            if codigo == 429:
-                print(f"     Rate limit alcanzado — esperar 60s entre ejecuciones.")
-            return []
-
-        valores = data.get('values', [])
-        if not valores:
-            print(f"  ⚠️  Twelve Data: sin valores para {simbolo} (respuesta vacía)")
-            print(f"     Meta recibida: {data.get('meta', {})}")
-            return []
-
-        # Convertir y filtrar al rango de días solicitado
-        fecha_limite = datetime.utcnow() - timedelta(days=dias)
-        candles = []
-        for v in reversed(valores):          # invertir: Twelve Data viene desc → asc
-            try:
-                dt = datetime.strptime(v['datetime'], '%Y-%m-%d %H:%M:%S')
-            except ValueError:
-                dt = datetime.strptime(v['datetime'], '%Y-%m-%d')
-            if dt < fecha_limite:
-                continue
-            candles.append({
-                'datetime': v['datetime'],
-                'open':     float(v['open']),
-                'high':     float(v['high']),
-                'low':      float(v['low']),
-                'close':    float(v['close']),
-                'volume':   float(v.get('volume', 0) or 0),
-            })
-
-        if not candles:
-            primera = valores[-1]['datetime'] if valores else '?'
-            ultima  = valores[0]['datetime']  if valores else '?'
-            print(f"  ⚠️  {simbolo}: se recibieron {len(valores)} velas pero ninguna dentro del rango.")
-            print(f"     Rango recibido: {primera} → {ultima}")
-            print(f"     Rango esperado: desde {fecha_limite.strftime('%Y-%m-%d')} en adelante.")
-            return []
-
-        print(f"  📥 {simbolo} ({tipo}): {len(candles)} velas M15 | "
-              f"{candles[0]['datetime']} → {candles[-1]['datetime']}")
-        return candles
-
-    except requests.exceptions.ConnectionError as e:
-        print(f"  ❌ {simbolo}: sin conexión a api.twelvedata.com — {e}")
-        return []
-    except requests.exceptions.Timeout:
-        print(f"  ❌ {simbolo}: timeout (>30s) conectando a Twelve Data")
-        return []
-    except Exception as e:
-        print(f"  ❌ Error inesperado obteniendo candles M15 {simbolo}: {type(e).__name__}: {e}")
-        return []
-
-
 def calcular_ema(precios: list[float], periodo: int) -> list[float]:
     """Exponential Moving Average."""
     if len(precios) < periodo:
@@ -388,106 +351,101 @@ def analizar_tendencia(candles: list[dict]) -> str:
 
 def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
     """
-    Obtiene y analiza velas M15 (7 días) de cada instrumento via Twelve Data.
-    Usa lista de candidatos por instrumento: si el primero falla intenta el siguiente.
+    Obtiene y analiza velas M15 (7 días) de cada instrumento via MetaTrader 5 (Pepperstone).
+    MT5 debe estar abierto en la misma máquina con sesión activa.
     Indicadores: EMA50/200 (tendencia), RSI(14), ATR(14), Perfil de Volumen adaptativo.
     """
-    print("🔍 Verificando conexión a Twelve Data...")
-    diag = diagnosticar_twelve_data()
+    print("🔍 Verificando MetaTrader 5 (Pepperstone)...")
+    diag = diagnosticar_mt5()
     if diag != 'ok':
-        msg = f"⚠️ Twelve Data no disponible: {diag}"
+        msg = f"⚠️ MT5 no disponible: {diag}"
         print(f"  {msg}")
         return {}, msg
 
-    resumen_dict = {}
+    resumen_dict  = {}
     bloques_texto = []
 
-    for instrumento, cfg in TWELVE_DATA_SYMBOLS.items():
-        candidatos = cfg['candidatos']
-        candles    = []
-        simbolo_ok = None
-        tipo_ok    = None
+    try:
+        for instrumento, simbolo in MT5_SYMBOLS.items():
+            print(f"  🔎 {instrumento}: descargando velas M15 ({simbolo})...")
+            candles = obtener_candles_mt5(simbolo, dias=M15_DIAS)
 
-        for simbolo, tipo in candidatos:
-            print(f"  🔎 {instrumento}: probando {simbolo} ({tipo})...")
-            candles = obtener_candles_twelvedata(simbolo, tipo, dias=M15_DIAS)
-            if candles:
-                simbolo_ok = simbolo
-                tipo_ok    = tipo
-                break
-            print(f"     ↳ Sin datos para {simbolo}, probando siguiente candidato...")
+            if not candles:
+                resumen_dict[instrumento] = {
+                    'error': f'Sin datos para {simbolo} en MT5/Pepperstone'
+                }
+                bloques_texto.append(f"{instrumento}: Sin datos desde MT5 ({simbolo}).")
+                continue
 
-        if not candles:
-            candidatos_str = ", ".join(s for s, _ in candidatos)
+            closes        = [c['close'] for c in candles]
+            precio_actual = closes[-1]
+            precio_inicio = closes[0]
+            cambio_pct    = round(((precio_actual - precio_inicio) / precio_inicio) * 100, 2)
+
+            tendencia = analizar_tendencia(candles)
+            rsi       = calcular_rsi(closes, RSI_PERIODO)
+            atr       = calcular_atr(candles, ATR_PERIODO)
+            perfil    = calcular_perfil_volumen(candles)
+
+            if rsi is not None:
+                if rsi > 70:   rsi_interp = "sobrecomprado"
+                elif rsi < 30: rsi_interp = "sobrevendido"
+                else:          rsi_interp = "neutral"
+            else:
+                rsi_interp = "N/A"
+
             resumen_dict[instrumento] = {
-                'error': f'Sin datos tras intentar: {candidatos_str}'
+                'simbolo_fuente': simbolo,
+                'precio_actual':  precio_actual,
+                'cambio_7d_pct':  cambio_pct,
+                'tendencia':      tendencia,
+                'rsi':            rsi,
+                'rsi_interp':     rsi_interp,
+                'atr_m15':        atr,
+                'perfil_volumen': perfil,
+                'num_velas':      len(candles),
             }
-            bloques_texto.append(
-                f"{instrumento}: Sin datos disponibles (intentados: {candidatos_str})."
+
+            hvn_str       = ", ".join(str(p) for p in perfil.get('hvn', [])) or "N/A"
+            lvn_str       = ", ".join(str(p) for p in perfil.get('lvn', [])) or "N/A"
+            muestra_velas = candles[-8:]
+
+            bloque = (
+                f"=== {instrumento} ({simbolo}) — M15, Pepperstone MT5 ===\n"
+                f"Fuente: MetaTrader 5 (feed real Pepperstone) | Velas: {len(candles)} M15 ({M15_DIAS} días)\n"
+                f"Rango 7d: {perfil.get('rango_min', 'N/A')} – {perfil.get('rango_max', 'N/A')}\n"
+                f"Precio actual (último cierre M15): {precio_actual}\n"
+                f"Cambio 7d: {cambio_pct:+.2f}%\n"
+                f"Tendencia (EMA{EMA_RAPIDA}/EMA{EMA_LENTA} M15): {tendencia}\n"
+                f"RSI({RSI_PERIODO}) M15: {rsi} ({rsi_interp})\n"
+                f"ATR({ATR_PERIODO}) M15: {atr}\n"
+                f"Perfil de Volumen:\n"
+                f"  POC (Point of Control): {perfil.get('poc', 'N/A')}\n"
+                f"  VAH (Value Area High):  {perfil.get('vah', 'N/A')}\n"
+                f"  VAL (Value Area Low):   {perfil.get('val', 'N/A')}\n"
+                f"  HVN (soporte/resistencia fuerte): {hvn_str}\n"
+                f"  LVN (zona de baja liquidez):      {lvn_str}\n"
+                f"Últimas 8 velas M15:\n"
             )
-            continue
+            for c in muestra_velas:
+                bloque += f"  {c['datetime']}: O={c['open']} H={c['high']} L={c['low']} C={c['close']}\n"
 
-        closes        = [c['close'] for c in candles]
-        precio_actual = closes[-1]
-        precio_inicio = closes[0]
-        cambio_pct    = round(((precio_actual - precio_inicio) / precio_inicio) * 100, 2)
+            bloques_texto.append(bloque)
+            print(f"  ✅ {instrumento}: precio={precio_actual} | "
+                  f"RSI={rsi} | POC={perfil.get('poc','?')} | velas={len(candles)}")
 
-        tendencia = analizar_tendencia(candles)
-        rsi       = calcular_rsi(closes, RSI_PERIODO)
-        atr       = calcular_atr(candles, ATR_PERIODO)
-        perfil    = calcular_perfil_volumen(candles)  # resolución adaptativa automática
-
-        if rsi is not None:
-            if rsi > 70:   rsi_interp = "sobrecomprado"
-            elif rsi < 30: rsi_interp = "sobrevendido"
-            else:          rsi_interp = "neutral"
-        else:
-            rsi_interp = "N/A"
-
-        resumen_dict[instrumento] = {
-            'simbolo_fuente': simbolo_ok,
-            'tipo':           tipo_ok,
-            'precio_actual':  precio_actual,
-            'cambio_7d_pct':  cambio_pct,
-            'tendencia':      tendencia,
-            'rsi':            rsi,
-            'rsi_interp':     rsi_interp,
-            'atr_m15':        atr,
-            'perfil_volumen': perfil,
-            'num_velas':      len(candles),
-        }
-
-        # Texto para el prompt de Claude (RSI y ATR van al prompt de la IA
-        # pero NO se muestran al usuario en Discord — ver formatear_campo_tecnico)
-        hvn_str = ", ".join(str(p) for p in perfil.get('hvn', [])) or "N/A"
-        lvn_str = ", ".join(str(p) for p in perfil.get('lvn', [])) or "N/A"
-        muestra_velas = candles[-8:]
-
-        bloque = (
-            f"=== {instrumento} ({simbolo_ok}) — Temporalidad M15 ===\n"
-            f"Fuente: Twelve Data | Velas: {len(candles)} M15 ({M15_DIAS} días)\n"
-            f"Rango 7d: {perfil.get('rango_min', 'N/A')} – {perfil.get('rango_max', 'N/A')}\n"
-            f"Precio actual (último cierre M15): {precio_actual}\n"
-            f"Cambio 7d: {cambio_pct:+.2f}%\n"
-            f"Tendencia (EMA{EMA_RAPIDA}/EMA{EMA_LENTA} M15): {tendencia}\n"
-            f"RSI({RSI_PERIODO}) M15: {rsi} ({rsi_interp})\n"
-            f"ATR({ATR_PERIODO}) M15: {atr}\n"
-            f"Perfil de Volumen:\n"
-            f"  POC (Point of Control): {perfil.get('poc', 'N/A')}\n"
-            f"  VAH (Value Area High):  {perfil.get('vah', 'N/A')}\n"
-            f"  VAL (Value Area Low):   {perfil.get('val', 'N/A')}\n"
-            f"  HVN (soporte/resistencia fuerte): {hvn_str}\n"
-            f"  LVN (zona de baja liquidez):      {lvn_str}\n"
-            f"Últimas 8 velas M15:\n"
-        )
-        for c in muestra_velas:
-            bloque += f"  {c['datetime']}: O={c['open']} H={c['high']} L={c['low']} C={c['close']}\n"
-
-        bloques_texto.append(bloque)
-        print(f"  ✅ {instrumento} ({simbolo_ok}): precio={precio_actual} | "
-              f"RSI={rsi} | POC={perfil.get('poc','?')} | velas={len(candles)}")
+    finally:
+        # Cerrar conexión MT5 al terminar todas las solicitudes
+        try:
+            import MetaTrader5 as mt5
+            mt5.shutdown()
+            print("  🔌 MT5 desconectado correctamente.")
+        except Exception:
+            pass
 
     return resumen_dict, "\n\n".join(bloques_texto)
+
+
 
 
 # ════════════════════════════════════════════════════════════
@@ -742,9 +700,8 @@ def formatear_campo_tecnico(instrumento: str, datos: dict) -> str:
     pv     = datos.get('perfil_volumen', {})
     hvn    = ", ".join(str(p) for p in pv.get('hvn', [])) or "N/A"
     lvn    = ", ".join(str(p) for p in pv.get('lvn', [])) or "N/A"
-    fuente = datos.get('simbolo_fuente', '?')
     return (
-        f"💲 **{instrumento}** (via {fuente}) — **{datos['precio_actual']}** ({datos['cambio_7d_pct']:+.2f}% 7d) | {datos.get('num_velas','?')} velas M15\n"
+        f"💲 **{instrumento}** — **{datos['precio_actual']}** ({datos['cambio_7d_pct']:+.2f}% 7d) | {datos.get('num_velas','?')} velas M15\n"
         f"📈 {datos['tendencia']}\n"
         f"🗂️ POC: **{pv.get('poc','N/A')}** | VAH: {pv.get('vah','N/A')} | VAL: {pv.get('val','N/A')}\n"
         f"🟢 HVN: {hvn}\n"
@@ -845,13 +802,13 @@ def ejecutar_agente():
     ]
 
     payload = {
-        "content": "@everyone 🛰️ **Sentinel v2.6: Reporte Semanal de Inteligencia**",
+        "content": "@everyone 🛰️ **Sentinel v2.8: Reporte Semanal de Inteligencia**",
         "embeds": [{
             "title": f"🛡️ INTELIGENCIA DE MERCADO | {ahora} (Tijuana)",
             "color": color,
             "fields": fields,
             "footer": {
-                "text": "Sentinel v2.6 | Tijuana Local Time | Datos: NewsAPI + FinnHub + Twelve Data M15 | IA: Claude Sonnet"
+                "text": "Sentinel v2.8 | Tijuana Local Time | Datos: NewsAPI + FinnHub + MT5/Pepperstone M15 | IA: Claude Sonnet"
             }
         }]
     }
