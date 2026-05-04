@@ -7,159 +7,23 @@ from datetime import datetime, timedelta
 TIJUANA_TZ = pytz.timezone('America/Tijuana')
 
 # ─────────────────────────────────────────────────────────────
-# Fuente de precios: MetaTrader 5 (Pepperstone) — conexión local
-# Requiere que MT5 de Pepperstone esté abierto en la misma máquina.
-# Sin APIs externas, sin tokens, sin límites de rate.
-# Los precios son exactamente los del feed de tu broker.
-#
-# Dependencia: pip install MetaTrader5
-# Símbolos: exactamente como aparecen en el Market Watch de MT5.
-# Verificar en MT5: Ver → Símbolos → buscar el nombre exacto.
+# Fuente de precios: Twelve Data — solo XAUUSD (oro spot)
+# Temporalidad M15, 7 días.
 # ─────────────────────────────────────────────────────────────
 
-# Constantes de temporalidad M15
-M15_VELAS_POR_DIA  = 96   # forex 24h × 4; índices CFD ~23h en Pepperstone
+M15_VELAS_POR_DIA  = 96
 M15_DIAS           = 7
-# Períodos de indicadores en unidades de velas M15
-EMA_RAPIDA         = 50   # ≈ 12.5h
-EMA_LENTA          = 200  # ≈ 50h
+M15_TOTAL_VELAS    = M15_VELAS_POR_DIA * M15_DIAS
+EMA_RAPIDA         = 50
+EMA_LENTA          = 200
 RSI_PERIODO        = 14
 ATR_PERIODO        = 14
 
-# Símbolos exactamente como aparecen en el Market Watch de MT5/Pepperstone.
-# Si alguno no funciona, abre MT5 → Ver → Símbolos y busca el nombre exacto.
-MT5_SYMBOLS = {
-    "XAUUSD": "XAUUSD",   # Oro spot
-    "US30":   "US30",     # Dow Jones CFD  (~42,000-49,000 pts en Pepperstone)
-    "NAS100": "NAS100",   # Nasdaq 100 CFD (~19,000-21,000 pts en Pepperstone)
+TWELVE_DATA_SYMBOLS = {
+    "XAUUSD": {
+        "candidatos": [("XAU/USD", "forex")],
+    },
 }
-
-
-# ════════════════════════════════════════════════════════════
-#  CAPA 0 — PRECIOS VIA MetaTrader 5 (PEPPERSTONE LOCAL)
-# ════════════════════════════════════════════════════════════
-def _mt5_importar():
-    """
-    Importa MetaTrader5 y retorna el módulo, o None con mensaje de error.
-    Separado para dar un error claro si el paquete no está instalado.
-    """
-    try:
-        import MetaTrader5 as mt5
-        return mt5
-    except ImportError:
-        print("  ❌ Paquete MetaTrader5 no instalado.")
-        print("     Ejecuta: pip install MetaTrader5")
-        return None
-
-
-def diagnosticar_mt5() -> str:
-    """
-    Verifica que MT5 esté instalado, abierto y conectado.
-    Retorna 'ok' o mensaje de error descriptivo.
-    """
-    mt5 = _mt5_importar()
-    if mt5 is None:
-        return "Paquete MetaTrader5 no instalado. Ejecuta: pip install MetaTrader5"
-
-    if not mt5.initialize():
-        err = mt5.last_error()
-        return (
-            f"MT5 no pudo inicializarse (código {err[0]}: {err[1]}). "
-            "Asegúrate de que MetaTrader 5 de Pepperstone esté abierto y con sesión activa."
-        )
-
-    info = mt5.terminal_info()
-    if info is None:
-        mt5.shutdown()
-        return "MT5 inicializado pero no se pudo obtener terminal_info."
-
-    cuenta = mt5.account_info()
-    broker  = cuenta.company if cuenta else "desconocido"
-    server  = cuenta.server  if cuenta else "desconocido"
-    balance = cuenta.balance if cuenta else 0
-    print(f"  🖥️  MT5 OK — broker={broker} | server={server} | balance={balance:.2f}")
-    # No llamar mt5.shutdown() aquí — se reutiliza la conexión en las llamadas siguientes
-    return 'ok'
-
-
-def obtener_candles_mt5(nombre_simbolo: str, dias: int = M15_DIAS) -> list[dict]:
-    """
-    Descarga velas M15 de los últimos `dias` días desde MetaTrader 5.
-    MT5 debe estar abierto en la misma máquina con sesión de Pepperstone activa.
-
-    Usa mt5.copy_rates_range() para obtener exactamente el rango de fechas.
-    Los precios son los del feed real de Pepperstone — idénticos a los que ves en la plataforma.
-
-    Retorna lista de dicts: datetime, open, high, low, close, volume (cronológico asc).
-    """
-    mt5 = _mt5_importar()
-    if mt5 is None:
-        return []
-
-    if not mt5.initialize():
-        err = mt5.last_error()
-        print(f"  ❌ {nombre_simbolo}: MT5 no inicializado — {err}")
-        return []
-
-    try:
-        # Verificar que el símbolo existe y está disponible
-        info = mt5.symbol_info(nombre_simbolo)
-        if info is None:
-            print(f"  ⚠️  {nombre_simbolo}: símbolo no encontrado en MT5.")
-            # Intentar activarlo en Market Watch y reintentar
-            mt5.symbol_select(nombre_simbolo, True)
-            info = mt5.symbol_info(nombre_simbolo)
-            if info is None:
-                # Sugerir nombres alternativos buscando coincidencias parciales
-                todos = [s.name for s in mt5.symbols_get() or [] if nombre_simbolo[:4] in s.name.upper()]
-                print(f"     Símbolos similares disponibles: {todos[:8]}")
-                return []
-
-        if not info.visible:
-            mt5.symbol_select(nombre_simbolo, True)
-
-        # Rango de fechas: desde hace `dias` días hasta ahora (UTC)
-        fecha_fin   = datetime.utcnow()
-        fecha_ini   = fecha_fin - timedelta(days=dias + 2)  # +2 para fines de semana
-
-        # TIMEFRAME_M15 = 15 minutos
-        TIMEFRAME_M15 = mt5.TIMEFRAME_M15
-
-        rates = mt5.copy_rates_range(nombre_simbolo, TIMEFRAME_M15, fecha_ini, fecha_fin)
-
-        if rates is None or len(rates) == 0:
-            err = mt5.last_error()
-            print(f"  ⚠️  {nombre_simbolo}: sin datos de MT5 — {err}")
-            return []
-
-        # Filtrar al rango exacto solicitado (excluir el buffer de +2 días)
-        fecha_limite = datetime.utcnow() - timedelta(days=dias)
-        candles = []
-        for r in rates:
-            dt = datetime.utcfromtimestamp(r['time'])
-            if dt < fecha_limite:
-                continue
-            candles.append({
-                'datetime': dt.strftime('%Y-%m-%d %H:%M:%S'),
-                'open':     float(r['open']),
-                'high':     float(r['high']),
-                'low':      float(r['low']),
-                'close':    float(r['close']),
-                'volume':   float(r['tick_volume']),  # tick volume de MT5
-            })
-
-        # MT5 devuelve cronológico ascendente — no hace falta invertir
-        print(f"  📥 {nombre_simbolo}: {len(candles)} velas M15 | "
-              f"{candles[0]['datetime']} → {candles[-1]['datetime']}")
-        return candles
-
-    except Exception as e:
-        print(f"  ❌ {nombre_simbolo}: error inesperado — {type(e).__name__}: {e}")
-        return []
-    finally:
-        # shutdown() cierra la conexión — solo llamar al terminar todas las solicitudes
-        # Se llama en obtener_analisis_tecnico_instrumentos después del loop
-        pass
 
 
 # ════════════════════════════════════════════════════════════
@@ -183,10 +47,120 @@ def calcular_ventanas():
 
 
 # ════════════════════════════════════════════════════════════
+#  CAPA 0 — PRECIOS Y ANÁLISIS TÉCNICO (solo XAUUSD)
+# ════════════════════════════════════════════════════════════
+def diagnosticar_twelve_data() -> str:
+    api_key = os.getenv('TWELVE_DATA_API_KEY')
+    if not api_key:
+        return "TWELVE_DATA_API_KEY no está definida en las variables de entorno."
+    try:
+        r = requests.get(
+            f"https://api.twelvedata.com/api_usage?apikey={api_key}",
+            timeout=10
+        )
+        if r.status_code == 403:
+            return f"HTTP 403 — posible bloqueo de red. Body: {r.text[:120]}"
+        if r.status_code == 401:
+            return "HTTP 401 — API key inválida o expirada."
+        if r.status_code != 200:
+            return f"HTTP {r.status_code} inesperado. Body: {r.text[:120]}"
+        data = r.json()
+        if data.get('status') == 'error':
+            return f"Twelve Data error: {data.get('message', 'desconocido')}"
+        plan  = data.get('plan', '?')
+        usado = data.get('current_usage', '?')
+        limit = data.get('daily_limit', '?')
+        print(f"  🔑 Twelve Data OK — plan={plan} | uso hoy={usado}/{limit}")
+        return 'ok'
+    except requests.exceptions.ConnectionError as e:
+        return f"Sin conexión a api.twelvedata.com: {e}"
+    except Exception as e:
+        return f"Error inesperado: {type(e).__name__}: {e}"
+
+
+def obtener_candles_twelvedata(simbolo: str, tipo: str, dias: int = M15_DIAS) -> list[dict]:
+    api_key = os.getenv('TWELVE_DATA_API_KEY')
+    if not api_key:
+        return []
+
+    outputsize = 700 if tipo == 'forex' else 250
+
+    url = (
+        f"https://api.twelvedata.com/time_series"
+        f"?symbol={simbolo}"
+        f"&interval=15min"
+        f"&outputsize={outputsize}"
+        f"&timezone=UTC"
+        f"&apikey={api_key}"
+    )
+
+    try:
+        res = requests.get(url, timeout=30)
+
+        if res.status_code == 403 and 'allowlist' in res.text.lower():
+            print(f"  🚫 {simbolo}: dominio bloqueado por proxy de red.")
+            return []
+        if res.status_code == 401:
+            print(f"  🔑 {simbolo}: API key inválida o expirada.")
+            return []
+
+        res.raise_for_status()
+        data = res.json()
+
+        if data.get('status') == 'error':
+            codigo = data.get('code', '?')
+            msg    = data.get('message', 'desconocido')
+            print(f"  ⚠️  Twelve Data [{simbolo}] error {codigo}: {msg}")
+            return []
+
+        valores = data.get('values', [])
+        if not valores:
+            print(f"  ⚠️  Twelve Data: sin valores para {simbolo}")
+            return []
+
+        fecha_limite = datetime.utcnow() - timedelta(days=dias)
+        candles = []
+        for v in reversed(valores):
+            try:
+                dt = datetime.strptime(v['datetime'], '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                dt = datetime.strptime(v['datetime'], '%Y-%m-%d')
+            if dt < fecha_limite:
+                continue
+            candles.append({
+                'datetime': v['datetime'],
+                'open':     float(v['open']),
+                'high':     float(v['high']),
+                'low':      float(v['low']),
+                'close':    float(v['close']),
+                'volume':   float(v.get('volume', 0) or 0),
+            })
+
+        if not candles:
+            primera = valores[-1]['datetime'] if valores else '?'
+            ultima  = valores[0]['datetime']  if valores else '?'
+            print(f"  ⚠️  {simbolo}: {len(valores)} velas fuera del rango ({primera} → {ultima}).")
+            return []
+
+        print(f"  📥 {simbolo}: {len(candles)} velas M15 | "
+              f"{candles[0]['datetime']} → {candles[-1]['datetime']}")
+        return candles
+
+    except requests.exceptions.ConnectionError as e:
+        print(f"  ❌ {simbolo}: sin conexión — {e}")
+        return []
+    except requests.exceptions.Timeout:
+        print(f"  ❌ {simbolo}: timeout >30s")
+        return []
+    except Exception as e:
+        print(f"  ❌ {simbolo}: {type(e).__name__}: {e}")
+        return []
+
+
+# ════════════════════════════════════════════════════════════
 #  INDICADORES TÉCNICOS
 # ════════════════════════════════════════════════════════════
 def calcular_ema(precios: list[float], periodo: int) -> list[float]:
-    """Exponential Moving Average."""
     if len(precios) < periodo:
         return []
     k = 2 / (periodo + 1)
@@ -197,7 +171,6 @@ def calcular_ema(precios: list[float], periodo: int) -> list[float]:
 
 
 def calcular_rsi(precios: list[float], periodo: int = 14) -> float | None:
-    """RSI clásico de Wilder."""
     if len(precios) < periodo + 1:
         return None
     ganancias, perdidas = [], []
@@ -209,45 +182,30 @@ def calcular_rsi(precios: list[float], periodo: int = 14) -> float | None:
     avg_p = sum(perdidas[-periodo:]) / periodo
     if avg_p == 0:
         return 100.0
-    rs = avg_g / avg_p
-    return round(100 - (100 / (1 + rs)), 2)
+    return round(100 - (100 / (1 + avg_g / avg_p)), 2)
 
 
-def calcular_atr(candles: list[dict], periodo: int = 7) -> float:
-    """Average True Range."""
+def calcular_atr(candles: list[dict], periodo: int = 14) -> float:
     trs = []
     for i in range(1, len(candles)):
-        h = candles[i]['high']
-        l = candles[i]['low']
+        h  = candles[i]['high']
+        l  = candles[i]['low']
         pc = candles[i - 1]['close']
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     if not trs:
         return 0.0
     return round(sum(trs[-periodo:]) / min(len(trs), periodo), 4)
 
 
 def calcular_perfil_volumen(candles: list[dict], num_niveles: int = None) -> dict:
-    """
-    Volume Profile simplificado:
-    - Divide el rango total en `num_niveles` buckets de precio.
-    - Distribuye el volumen de cada vela proporcionalmente por rango.
-    - num_niveles es adaptativo si no se especifica: sqrt(n_velas) con mínimo 20, máximo 60.
-      Con pocas velas (índices M15 ~120 velas) esto evita buckets vacíos que distorsionan el POC.
-    - HVN: picos locales de volumen fuera del Value Area (soporte/resistencia real).
-    - LVN: valles locales entre HVNs (zonas de baja liquidez / aceleración).
-    Retorna dict con: poc, vah, val, hvn, lvn, rango_min, rango_max.
-    """
     if not candles:
         return {}
-
     precio_min = min(c['low']  for c in candles)
     precio_max = max(c['high'] for c in candles)
     rango = precio_max - precio_min
     if rango == 0:
         return {}
 
-    # Resolución adaptativa: raíz cuadrada del número de velas, acotada
     if num_niveles is None:
         num_niveles = max(20, min(60, int(len(candles) ** 0.5)))
 
@@ -255,7 +213,6 @@ def calcular_perfil_volumen(candles: list[dict], num_niveles: int = None) -> dic
     buckets = [0.0] * num_niveles
 
     for c in candles:
-        # Usar volumen real si existe y es positivo; si no, ponderar por rango de vela
         vol = c['volume'] if c['volume'] > 0 else (c['high'] - c['low'])
         if vol <= 0:
             vol = 1.0
@@ -275,11 +232,9 @@ def calcular_perfil_volumen(candles: list[dict], num_niveles: int = None) -> dic
     if vol_total == 0:
         return {}
 
-    # POC = bucket con mayor volumen acumulado
     poc_idx   = buckets.index(max(buckets))
     poc_price = precio_min + (poc_idx + 0.5) * bucket_size
 
-    # VAH / VAL: zona que contiene el 70% del volumen alrededor del POC
     target = vol_total * 0.70
     acum   = buckets[poc_idx]
     lo, hi = poc_idx, poc_idx
@@ -287,31 +242,27 @@ def calcular_perfil_volumen(candles: list[dict], num_niveles: int = None) -> dic
         expand_lo = buckets[lo - 1] if lo > 0 else -1
         expand_hi = buckets[hi + 1] if hi < num_niveles - 1 else -1
         if expand_lo >= expand_hi and lo > 0:
-            lo -= 1
-            acum += buckets[lo]
+            lo -= 1; acum += buckets[lo]
         elif hi < num_niveles - 1:
-            hi += 1
-            acum += buckets[hi]
+            hi += 1; acum += buckets[hi]
         else:
             break
     val_price = precio_min + (lo + 0.5) * bucket_size
     vah_price = precio_min + (hi + 0.5) * bucket_size
 
-    # HVN: picos locales fuera del Value Area (máximo local > ambos vecinos)
     hvn_precios = []
     for i in range(1, num_niveles - 1):
         if (i < lo or i > hi) and buckets[i] > buckets[i-1] and buckets[i] > buckets[i+1]:
             hvn_precios.append((buckets[i], precio_min + (i + 0.5) * bucket_size))
     hvn_precios.sort(reverse=True)
-    hvn_prices = sorted([p for _, p in hvn_precios[:4]])  # top 4 HVNs ordenados por precio
+    hvn_prices = sorted([p for _, p in hvn_precios[:4]])
 
-    # LVN: valles locales (mínimo local < ambos vecinos), con volumen > 0
     lvn_precios = []
     for i in range(1, num_niveles - 1):
         if buckets[i] > 0 and buckets[i] < buckets[i-1] and buckets[i] < buckets[i+1]:
             lvn_precios.append((buckets[i], precio_min + (i + 0.5) * bucket_size))
     lvn_precios.sort()
-    lvn_prices = sorted([p for _, p in lvn_precios[:4]])  # top 4 LVNs ordenados por precio
+    lvn_prices = sorted([p for _, p in lvn_precios[:4]])
 
     return {
         'poc':       round(poc_price, 4),
@@ -325,24 +276,18 @@ def calcular_perfil_volumen(candles: list[dict], num_niveles: int = None) -> dic
 
 
 def analizar_tendencia(candles: list[dict]) -> str:
-    """
-    Tendencia basada en EMA50 vs EMA200 sobre cierres M15.
-    EMA50  M15 ≈ 12.5 horas  (tendencia corto plazo intradía)
-    EMA200 M15 ≈ 50 horas    (tendencia estructural de la semana)
-    """
     if len(candles) < EMA_RAPIDA + 1:
         return f"insuficientes datos (se necesitan ≥{EMA_RAPIDA + 1} velas M15)"
     closes = [c['close'] for c in candles]
     ema_r  = calcular_ema(closes, EMA_RAPIDA)
     ema_l  = calcular_ema(closes, min(EMA_LENTA, len(closes)))
-    slope  = closes[-1] - closes[max(0, len(closes) - M15_VELAS_POR_DIA)]  # pendiente del último día
-
+    slope  = closes[-1] - closes[max(0, len(closes) - M15_VELAS_POR_DIA)]
     if ema_r and ema_l:
         if ema_r[-1] > ema_l[-1] and slope > 0:
             return f"alcista (EMA{EMA_RAPIDA} > EMA{EMA_LENTA}, pendiente positiva en M15)"
         elif ema_r[-1] < ema_l[-1] and slope < 0:
             return f"bajista (EMA{EMA_RAPIDA} < EMA{EMA_LENTA}, pendiente negativa en M15)"
-        elif ema_r[-1] > ema_l[-1] and slope <= 0:
+        elif ema_r[-1] > ema_l[-1]:
             return f"alcista estructural / pullback intradiario (EMA{EMA_RAPIDA} > EMA{EMA_LENTA})"
         else:
             return f"bajista estructural / rebote intradiario (EMA{EMA_RAPIDA} < EMA{EMA_LENTA})"
@@ -350,102 +295,95 @@ def analizar_tendencia(candles: list[dict]) -> str:
 
 
 def obtener_analisis_tecnico_instrumentos() -> tuple[dict, str]:
-    """
-    Obtiene y analiza velas M15 (7 días) de cada instrumento via MetaTrader 5 (Pepperstone).
-    MT5 debe estar abierto en la misma máquina con sesión activa.
-    Indicadores: EMA50/200 (tendencia), RSI(14), ATR(14), Perfil de Volumen adaptativo.
-    """
-    print("🔍 Verificando MetaTrader 5 (Pepperstone)...")
-    diag = diagnosticar_mt5()
+    """Solo XAUUSD vía Twelve Data."""
+    print("🔍 Verificando Twelve Data...")
+    diag = diagnosticar_twelve_data()
     if diag != 'ok':
-        msg = f"⚠️ MT5 no disponible: {diag}"
+        msg = f"⚠️ Twelve Data no disponible: {diag}"
         print(f"  {msg}")
         return {}, msg
 
     resumen_dict  = {}
     bloques_texto = []
 
-    try:
-        for instrumento, simbolo in MT5_SYMBOLS.items():
-            print(f"  🔎 {instrumento}: descargando velas M15 ({simbolo})...")
-            candles = obtener_candles_mt5(simbolo, dias=M15_DIAS)
+    for instrumento, cfg in TWELVE_DATA_SYMBOLS.items():
+        candidatos = cfg['candidatos']
+        candles    = []
+        simbolo_ok = None
+        tipo_ok    = None
 
-            if not candles:
-                resumen_dict[instrumento] = {
-                    'error': f'Sin datos para {simbolo} en MT5/Pepperstone'
-                }
-                bloques_texto.append(f"{instrumento}: Sin datos desde MT5 ({simbolo}).")
-                continue
+        for simbolo, tipo in candidatos:
+            print(f"  🔎 {instrumento}: probando {simbolo} ({tipo})...")
+            candles = obtener_candles_twelvedata(simbolo, tipo, dias=M15_DIAS)
+            if candles:
+                simbolo_ok = simbolo
+                tipo_ok    = tipo
+                break
+            print(f"     ↳ Sin datos para {simbolo}.")
 
-            closes        = [c['close'] for c in candles]
-            precio_actual = closes[-1]
-            precio_inicio = closes[0]
-            cambio_pct    = round(((precio_actual - precio_inicio) / precio_inicio) * 100, 2)
+        if not candles:
+            candidatos_str = ", ".join(s for s, _ in candidatos)
+            resumen_dict[instrumento] = {'error': f'Sin datos ({candidatos_str})'}
+            bloques_texto.append(f"{instrumento}: Sin datos disponibles.")
+            continue
 
-            tendencia = analizar_tendencia(candles)
-            rsi       = calcular_rsi(closes, RSI_PERIODO)
-            atr       = calcular_atr(candles, ATR_PERIODO)
-            perfil    = calcular_perfil_volumen(candles)
+        closes        = [c['close'] for c in candles]
+        precio_actual = closes[-1]
+        precio_inicio = closes[0]
+        cambio_pct    = round(((precio_actual - precio_inicio) / precio_inicio) * 100, 2)
 
-            if rsi is not None:
-                if rsi > 70:   rsi_interp = "sobrecomprado"
-                elif rsi < 30: rsi_interp = "sobrevendido"
-                else:          rsi_interp = "neutral"
-            else:
-                rsi_interp = "N/A"
+        tendencia = analizar_tendencia(candles)
+        rsi       = calcular_rsi(closes, RSI_PERIODO)
+        atr       = calcular_atr(candles, ATR_PERIODO)
+        perfil    = calcular_perfil_volumen(candles)
 
-            resumen_dict[instrumento] = {
-                'simbolo_fuente': simbolo,
-                'precio_actual':  precio_actual,
-                'cambio_7d_pct':  cambio_pct,
-                'tendencia':      tendencia,
-                'rsi':            rsi,
-                'rsi_interp':     rsi_interp,
-                'atr_m15':        atr,
-                'perfil_volumen': perfil,
-                'num_velas':      len(candles),
-            }
+        if rsi is not None:
+            if rsi > 70:   rsi_interp = "sobrecomprado"
+            elif rsi < 30: rsi_interp = "sobrevendido"
+            else:          rsi_interp = "neutral"
+        else:
+            rsi_interp = "N/A"
 
-            hvn_str       = ", ".join(str(p) for p in perfil.get('hvn', [])) or "N/A"
-            lvn_str       = ", ".join(str(p) for p in perfil.get('lvn', [])) or "N/A"
-            muestra_velas = candles[-8:]
+        resumen_dict[instrumento] = {
+            'simbolo_fuente': simbolo_ok,
+            'precio_actual':  precio_actual,
+            'cambio_7d_pct':  cambio_pct,
+            'tendencia':      tendencia,
+            'rsi':            rsi,
+            'rsi_interp':     rsi_interp,
+            'atr_m15':        atr,
+            'perfil_volumen': perfil,
+            'num_velas':      len(candles),
+        }
 
-            bloque = (
-                f"=== {instrumento} ({simbolo}) — M15, Pepperstone MT5 ===\n"
-                f"Fuente: MetaTrader 5 (feed real Pepperstone) | Velas: {len(candles)} M15 ({M15_DIAS} días)\n"
-                f"Rango 7d: {perfil.get('rango_min', 'N/A')} – {perfil.get('rango_max', 'N/A')}\n"
-                f"Precio actual (último cierre M15): {precio_actual}\n"
-                f"Cambio 7d: {cambio_pct:+.2f}%\n"
-                f"Tendencia (EMA{EMA_RAPIDA}/EMA{EMA_LENTA} M15): {tendencia}\n"
-                f"RSI({RSI_PERIODO}) M15: {rsi} ({rsi_interp})\n"
-                f"ATR({ATR_PERIODO}) M15: {atr}\n"
-                f"Perfil de Volumen:\n"
-                f"  POC (Point of Control): {perfil.get('poc', 'N/A')}\n"
-                f"  VAH (Value Area High):  {perfil.get('vah', 'N/A')}\n"
-                f"  VAL (Value Area Low):   {perfil.get('val', 'N/A')}\n"
-                f"  HVN (soporte/resistencia fuerte): {hvn_str}\n"
-                f"  LVN (zona de baja liquidez):      {lvn_str}\n"
-                f"Últimas 8 velas M15:\n"
-            )
-            for c in muestra_velas:
-                bloque += f"  {c['datetime']}: O={c['open']} H={c['high']} L={c['low']} C={c['close']}\n"
+        hvn_str       = ", ".join(str(p) for p in perfil.get('hvn', [])) or "N/A"
+        lvn_str       = ", ".join(str(p) for p in perfil.get('lvn', [])) or "N/A"
+        muestra_velas = candles[-8:]
 
-            bloques_texto.append(bloque)
-            print(f"  ✅ {instrumento}: precio={precio_actual} | "
-                  f"RSI={rsi} | POC={perfil.get('poc','?')} | velas={len(candles)}")
+        bloque = (
+            f"=== {instrumento} ({simbolo_ok}) — Temporalidad M15 ===\n"
+            f"Fuente: Twelve Data | Velas: {len(candles)} M15 ({M15_DIAS} días)\n"
+            f"Rango 7d: {perfil.get('rango_min', 'N/A')} – {perfil.get('rango_max', 'N/A')}\n"
+            f"Precio actual (último cierre M15): {precio_actual}\n"
+            f"Cambio 7d: {cambio_pct:+.2f}%\n"
+            f"Tendencia (EMA{EMA_RAPIDA}/EMA{EMA_LENTA} M15): {tendencia}\n"
+            f"RSI({RSI_PERIODO}) M15: {rsi} ({rsi_interp})\n"
+            f"ATR({ATR_PERIODO}) M15: {atr}\n"
+            f"Perfil de Volumen:\n"
+            f"  POC (Point of Control): {perfil.get('poc', 'N/A')}\n"
+            f"  VAH (Value Area High):  {perfil.get('vah', 'N/A')}\n"
+            f"  VAL (Value Area Low):   {perfil.get('val', 'N/A')}\n"
+            f"  HVN (soporte/resistencia fuerte): {hvn_str}\n"
+            f"  LVN (zona de baja liquidez):      {lvn_str}\n"
+            f"Últimas 8 velas M15:\n"
+        )
+        for c in muestra_velas:
+            bloque += f"  {c['datetime']}: O={c['open']} H={c['high']} L={c['low']} C={c['close']}\n"
 
-    finally:
-        # Cerrar conexión MT5 al terminar todas las solicitudes
-        try:
-            import MetaTrader5 as mt5
-            mt5.shutdown()
-            print("  🔌 MT5 desconectado correctamente.")
-        except Exception:
-            pass
+        bloques_texto.append(bloque)
+        print(f"  ✅ {instrumento}: precio={precio_actual} | RSI={rsi} | POC={perfil.get('poc','?')} | velas={len(candles)}")
 
     return resumen_dict, "\n\n".join(bloques_texto)
-
-
 
 
 # ════════════════════════════════════════════════════════════
@@ -457,8 +395,8 @@ def traducir_titulares(titulares_con_prefijo):
         traducidos = []
         for item in titulares_con_prefijo:
             partes = item.split(' ', 1)
-            emoji = partes[0]
-            texto = partes[1] if len(partes) > 1 else ''
+            emoji  = partes[0]
+            texto  = partes[1] if len(partes) > 1 else ''
             try:
                 texto_es = GoogleTranslator(source='auto', target='es').translate(texto)
             except Exception:
@@ -482,7 +420,7 @@ def obtener_noticias_geopoliticas(desde, hasta):
         f'&sortBy=publishedAt&pageSize=8&apiKey={api_key}'
     )
 
-    titulares = []
+    titulares     = []
     raw_titulares = []
     keywords_guerra = ['war', 'attack', 'missile', 'conflict', 'strike', 'troops', 'invasion']
     keywords_fed    = ['fed', 'fomc', 'rate', 'powell', 'inflation', 'cpi', 'pce']
@@ -492,7 +430,7 @@ def obtener_noticias_geopoliticas(desde, hasta):
         res.raise_for_status()
         articulos = res.json().get('articles', [])
         for art in articulos[:6]:
-            titulo = art.get('title') or 'Sin titulo'
+            titulo        = art.get('title') or 'Sin titulo'
             titulo_limpio = titulo.split(' - ')[0].strip()
             titulo_lower  = titulo_limpio.lower()
             raw_titulares.append(titulo_lower)
@@ -526,29 +464,27 @@ def obtener_calendario_alto_impacto(desde, hasta):
     url = f'https://finnhub.io/api/v1/calendar/economic?from={desde}&to={hasta}&token={api_key}'
 
     eventos_formateados = []
-    raw_eventos = []
+    raw_eventos         = []
     try:
         res = requests.get(url, timeout=30)
         res.raise_for_status()
-        eventos = res.json().get('economicCalendar', [])
+        eventos      = res.json().get('economicCalendar', [])
         eventos_alto = [e for e in eventos if e.get('impact', '').lower() == 'high']
         for e in eventos_alto[:10]:
-            pais  = e.get('country', '??').upper()
+            pais   = e.get('country', '??').upper()
             evento = e.get('event', 'Evento desconocido')
             fecha  = e.get('time', '') or 'TBD'
             prev   = e.get('prev', '')
             est    = e.get('estimate', '')
             raw_eventos.append(f"{pais}: {evento} (Est: {est}, Prev: {prev})")
             try:
-                dt = datetime.strptime(fecha[:10], '%Y-%m-%d')
+                dt        = datetime.strptime(fecha[:10], '%Y-%m-%d')
                 fecha_fmt = dt.strftime('%a %d/%m').capitalize()
             except Exception:
                 fecha_fmt = fecha[:10]
             linea = f"🔴 **{fecha_fmt}** | {pais}: {evento}"
-            if est:
-                linea += f" | Est: {est}"
-            if prev:
-                linea += f" | Prev: {prev}"
+            if est:  linea += f" | Est: {est}"
+            if prev: linea += f" | Prev: {prev}"
             eventos_formateados.append(linea)
     except requests.exceptions.HTTPError as e:
         return [f"Error FinnHub HTTP {e.response.status_code}"], []
@@ -562,7 +498,7 @@ def obtener_calendario_alto_impacto(desde, hasta):
 
 
 # ════════════════════════════════════════════════════════════
-#  CAPA 3 — RECOMENDACIONES IA (macro + técnico integrado)
+#  CAPA 3 — RECOMENDACIONES IA (solo XAUUSD)
 # ════════════════════════════════════════════════════════════
 def obtener_recomendaciones_ia(
     raw_titulares: list,
@@ -575,7 +511,7 @@ def obtener_recomendaciones_ia(
     if not api_key:
         return (
             "SESGO NO DISPONIBLE",
-            {"XAUUSD": ["ANTHROPIC_API_KEY no configurada."], "US30": [], "NAS100": []},
+            {"XAUUSD": ["ANTHROPIC_API_KEY no configurada."]},
             0x888888
         )
 
@@ -588,46 +524,41 @@ def obtener_recomendaciones_ia(
         f"{noticias_texto}\n\n"
         f"══ CAPA 2: CALENDARIO ECONÓMICO DE ALTO IMPACTO (próximos días) ══\n"
         f"{calendario_texto}\n\n"
-        f"══ CAPA 3: ANÁLISIS TÉCNICO + PERFIL DE VOLUMEN (últimos 7 días, datos reales) ══\n"
+        f"══ CAPA 3: ANÁLISIS TÉCNICO + PERFIL DE VOLUMEN XAUUSD (últimos 7 días, datos reales) ══\n"
         f"{analisis_tecnico_texto}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"INSTRUCCIONES:\n"
         f"1. Los rangos de precio DEBEN ser coherentes con los precios reales de la Capa 3.\n"
         f"2. Usa HVN como soporte/resistencia, LVN como zonas de aceleración, POC como equilibrio.\n"
-        f"3. Máximo 3 oraciones por instrumento. Directo y accionable.\n\n"
+        f"3. Máximo 3 oraciones. Directo y accionable.\n\n"
         f"FORMATO OBLIGATORIO — responde EXACTAMENTE así, sin texto adicional antes ni después:\n\n"
-        f"SESGO: <sesgo en una línea>\n"
+        f"SESGO: <sesgo en una línea enfocado en oro y contexto macro>\n"
         f"---\n"
-        f"XAUUSD: <recomendación XAUUSD con entrada, objetivo y stop>\n"
-        f"---\n"
-        f"US30: <recomendación US30 con entrada, objetivo y stop>\n"
-        f"---\n"
-        f"NAS100: <recomendación NAS100 con entrada, objetivo y stop>\n"
+        f"XAUUSD: <recomendación con entrada, objetivo y stop loss exactos>\n"
     )
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        client  = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
             model="claude-sonnet-4-5",
-            max_tokens=2048,
+            max_tokens=1024,
             system=(
-                "Eres un analista de mercados financieros con 35 años de experiencia y un CI de 180. "
-                "Combinas análisis técnico (EMA, RSI, ATR, perfil de volumen con HVN/LVN/POC/VAH/VAL) "
-                "con análisis macro y geopolítico. "
-                "REGLA CRÍTICA: Los rangos de precio en tus recomendaciones deben ser 100% coherentes "
-                "con los precios reales proporcionados en el análisis técnico. Nunca uses rangos obsoletos. "
+                "Eres un analista de mercados financieros especializado en oro (XAUUSD) "
+                "con 35 años de experiencia. Combinas análisis técnico (EMA, RSI, ATR, "
+                "perfil de volumen con HVN/LVN/POC/VAH/VAL) con análisis macro y geopolítico. "
+                "REGLA CRÍTICA: Los rangos de precio deben ser 100% coherentes con los precios "
+                "reales del análisis técnico proporcionado. Nunca uses rangos obsoletos. "
                 "Responde siempre en español. Sé preciso, directo y profesional. "
-                "Usa exactamente los prefijos SESGO:, XAUUSD:, US30:, NAS100: en tu respuesta."
+                "Usa exactamente los prefijos SESGO: y XAUUSD: en tu respuesta."
             ),
             messages=[{"role": "user", "content": prompt_usuario}]
         )
 
         respuesta = message.content[0].text.strip()
+        sesgo     = "Ver recomendación abajo"
+        bloques   = {'XAUUSD': []}
 
-        # Parsear usando '---' como delimitador de sección (más robusto que detectar prefijos)
-        sesgo   = "Ver recomendaciones abajo"
-        bloques = {'XAUUSD': [], 'US30': [], 'NAS100': []}
-
+        # Parser primario: delimitador '---'
         secciones = respuesta.split('---')
         for seccion in secciones:
             seccion = seccion.strip()
@@ -637,30 +568,21 @@ def obtener_recomendaciones_ia(
                 sesgo = seccion.split(':', 1)[1].strip()
             elif seccion.upper().startswith('XAUUSD:'):
                 bloques['XAUUSD'] = [seccion.strip()]
-            elif seccion.upper().startswith('US30:'):
-                bloques['US30'] = [seccion.strip()]
-            elif seccion.upper().startswith('NAS100:'):
-                bloques['NAS100'] = [seccion.strip()]
 
-        # Fallback: si el modelo no usó '---', parsear línea a línea con reset correcto
+        # Fallback: parseo línea a línea
         if not any(bloques.values()):
-            instrumentos  = ['XAUUSD', 'US30', 'NAS100']
-            clave_actual  = None
-            lineas        = respuesta.split('\n')
-            for linea in lineas:
+            clave_actual = None
+            for linea in respuesta.split('\n'):
                 linea_up = linea.upper().strip()
                 if linea_up.startswith('SESGO:'):
-                    sesgo = linea.split(':', 1)[1].strip()
-                    clave_actual = None   # salir de cualquier bloque activo
+                    sesgo        = linea.split(':', 1)[1].strip()
+                    clave_actual = None
                     continue
-                matched = False
-                for inst in instrumentos:
-                    if linea_up.startswith(inst + ':') or linea_up.startswith(inst + ' '):
-                        clave_actual = inst
-                        bloques[clave_actual] = [linea.strip()]
-                        matched = True
-                        break
-                if not matched and clave_actual and linea.strip():
+                if linea_up.startswith('XAUUSD:') or linea_up.startswith('XAUUSD '):
+                    clave_actual = 'XAUUSD'
+                    bloques['XAUUSD'] = [linea.strip()]
+                    continue
+                if clave_actual and linea.strip():
                     bloques[clave_actual].append(linea.strip())
 
         # Color según sesgo
@@ -681,7 +603,7 @@ def obtener_recomendaciones_ia(
     except Exception as e:
         return (
             "Error IA",
-            {"XAUUSD": [f"No se pudieron obtener recomendaciones: {str(e)}"], "US30": [], "NAS100": []},
+            {"XAUUSD": [f"No se pudieron obtener recomendaciones: {str(e)}"]},
             0x888888
         )
 
@@ -689,19 +611,15 @@ def obtener_recomendaciones_ia(
 # ════════════════════════════════════════════════════════════
 #  ENVÍO A DISCORD
 # ════════════════════════════════════════════════════════════
-def formatear_campo_tecnico(instrumento: str, datos: dict) -> str:
-    """
-    Resumen de Capa 0 para Discord.
-    Muestra: precio, tendencia, POC/VAH/VAL, HVN, LVN.
-    RSI y ATR se omiten del display (siguen en el prompt de la IA).
-    """
+def formatear_campo_tecnico(datos: dict) -> str:
+    """Resumen Capa 0 XAUUSD para Discord: POC, VAH, VAL, HVN, LVN."""
     if 'error' in datos:
         return f"⚠️ {datos['error']}"
-    pv     = datos.get('perfil_volumen', {})
-    hvn    = ", ".join(str(p) for p in pv.get('hvn', [])) or "N/A"
-    lvn    = ", ".join(str(p) for p in pv.get('lvn', [])) or "N/A"
+    pv  = datos.get('perfil_volumen', {})
+    hvn = ", ".join(str(p) for p in pv.get('hvn', [])) or "N/A"
+    lvn = ", ".join(str(p) for p in pv.get('lvn', [])) or "N/A"
     return (
-        f"💲 **{instrumento}** — **{datos['precio_actual']}** ({datos['cambio_7d_pct']:+.2f}% 7d) | {datos.get('num_velas','?')} velas M15\n"
+        f"💲 **XAUUSD** — **{datos['precio_actual']}** ({datos['cambio_7d_pct']:+.2f}% 7d) | {datos.get('num_velas','?')} velas M15\n"
         f"📈 {datos['tendencia']}\n"
         f"🗂️ POC: **{pv.get('poc','N/A')}** | VAH: {pv.get('vah','N/A')} | VAL: {pv.get('val','N/A')}\n"
         f"🟢 HVN: {hvn}\n"
@@ -721,15 +639,15 @@ def ejecutar_agente():
     print(f"📅 Noticias: {domingo_pasado} → {hoy_str}")
     print(f"📅 Calendario: {hoy_str} → {proximo_domingo}")
 
-    # ── Capa 0: Análisis técnico + perfil de volumen ────────
-    print("🔍 Obteniendo precios y análisis técnico...")
+    # ── Capa 0: XAUUSD análisis técnico ─────────────────────
+    print("🔍 Obteniendo precios y análisis técnico XAUUSD...")
     resumen_tecnico, analisis_tecnico_texto = obtener_analisis_tecnico_instrumentos()
 
-    # ── Capa 1: Noticias ────────────────────────────────────
+    # ── Capa 1: Noticias ─────────────────────────────────────
     print("📰 Obteniendo noticias...")
     noticias, raw_titulares = obtener_noticias_geopoliticas(domingo_pasado, hoy_str)
 
-    # ── Capa 2: Calendario ──────────────────────────────────
+    # ── Capa 2: Calendario ───────────────────────────────────
     print("📅 Obteniendo calendario económico...")
     resultado_calendario = obtener_calendario_alto_impacto(hoy_str, proximo_domingo)
     if isinstance(resultado_calendario, tuple):
@@ -737,8 +655,8 @@ def ejecutar_agente():
     else:
         calendario, raw_eventos = resultado_calendario, []
 
-    # ── Capa 3: IA con contexto completo ────────────────────
-    print("🤖 Generando recomendaciones con Claude...")
+    # ── Capa 3: IA ───────────────────────────────────────────
+    print("🤖 Generando recomendación XAUUSD con Claude...")
     sesgo, bloques, color = obtener_recomendaciones_ia(
         raw_titulares, raw_eventos, analisis_tecnico_texto,
         domingo_pasado, hoy_str
@@ -748,67 +666,54 @@ def ejecutar_agente():
         texto = "\n".join(lista)
         return texto[:1024] if texto else "Sin datos disponibles."
 
-    # Construir campos Capa 0 — uno por instrumento para no chocar con el límite de 1024 chars
-    def campo_tecnico_discord(inst):
-        datos = resumen_tecnico.get(inst)
-        if not datos:
-            # Sin datos: mostrar el mensaje de diagnóstico
-            motivo = analisis_tecnico_texto if analisis_tecnico_texto else "Sin datos — revisar logs del servidor."
-            return {
-                "name": f"📊 CAPA 0 — {inst} (M15)",
-                "value": f"⚠️ {motivo[:500]}",
-                "inline": False
-            }
-        return {
-            "name": f"📊 CAPA 0 — {inst} (M15, 7d)",
-            "value": formatear_campo_tecnico(inst, datos),
+    # Capa 0 — XAUUSD
+    datos_xau = resumen_tecnico.get('XAUUSD')
+    if datos_xau:
+        campo_capa0 = {
+            "name":   "📊 CAPA 0 — XAUUSD (M15, 7d)",
+            "value":  formatear_campo_tecnico(datos_xau),
+            "inline": False
+        }
+    else:
+        motivo = analisis_tecnico_texto or "Sin datos — revisar logs del servidor."
+        campo_capa0 = {
+            "name":   "📊 CAPA 0 — XAUUSD (M15)",
+            "value":  f"⚠️ {motivo[:500]}",
             "inline": False
         }
 
     fields = [
-        campo_tecnico_discord('XAUUSD'),
-        campo_tecnico_discord('US30'),
-        campo_tecnico_discord('NAS100'),
+        campo_capa0,
         {
-            "name": f"🌍 CAPA 1 — Noticias Macro & Geopolíticas (Dom {domingo_pasado} → Hoy)",
-            "value": safe_value(noticias),
+            "name":   f"🌍 CAPA 1 — Noticias Macro & Geopolíticas (Dom {domingo_pasado} → Hoy)",
+            "value":  safe_value(noticias),
             "inline": False
         },
         {
-            "name": f"📅 CAPA 2 — Calendario Alto Impacto (Hoy → Dom {proximo_domingo})",
-            "value": safe_value(calendario),
+            "name":   f"📅 CAPA 2 — Calendario Alto Impacto (Hoy → Dom {proximo_domingo})",
+            "value":  safe_value(calendario),
             "inline": False
         },
         {
-            "name": "🎯 CAPA 3 — Sesgo Semanal IA",
-            "value": f"**{sesgo}**",
+            "name":   "🎯 CAPA 3 — Sesgo Semanal IA",
+            "value":  f"**{sesgo}**",
             "inline": False
         },
         {
-            "name": "📌 Recomendaciones — XAUUSD (Claude AI)",
-            "value": ('\n'.join(bloques.get('XAUUSD', [])))[:1024] or "Sin datos.",
-            "inline": False
-        },
-        {
-            "name": "📌 Recomendaciones — US30 (Claude AI)",
-            "value": ('\n'.join(bloques.get('US30', [])))[:1024] or "Sin datos.",
-            "inline": False
-        },
-        {
-            "name": "📌 Recomendaciones — NAS100 (Claude AI)",
-            "value": ('\n'.join(bloques.get('NAS100', [])))[:1024] or "Sin datos.",
+            "name":   "📌 Recomendaciones — XAUUSD (Claude AI)",
+            "value":  ('\n'.join(bloques.get('XAUUSD', [])))[:1024] or "Sin datos.",
             "inline": False
         },
     ]
 
     payload = {
-        "content": "@everyone 🛰️ **Sentinel v2.8: Reporte Semanal de Inteligencia**",
+        "content": "@everyone 🛰️ **Sentinel v2.9: Reporte Semanal de Inteligencia**",
         "embeds": [{
-            "title": f"🛡️ INTELIGENCIA DE MERCADO | {ahora} (Tijuana)",
-            "color": color,
+            "title":  f"🛡️ INTELIGENCIA DE MERCADO — XAUUSD | {ahora} (Tijuana)",
+            "color":  color,
             "fields": fields,
             "footer": {
-                "text": "Sentinel v2.8 | Tijuana Local Time | Datos: NewsAPI + FinnHub + MT5/Pepperstone M15 | IA: Claude Sonnet"
+                "text": "Sentinel v2.9 | Tijuana Local Time | Datos: NewsAPI + FinnHub + Twelve Data M15 | IA: Claude Sonnet"
             }
         }]
     }
