@@ -33,11 +33,15 @@ RSI_PERIODO        = 14   # estándar Wilder, sobre cierres M15
 ATR_PERIODO        = 14   # estándar, sobre rangos verdaderos M15
 
 # Twelve Data: símbolo principal y tipo de instrumento
-# type: 'forex' usa /time_series directo; 'etf'/'stock' también usa /time_series
+# Usamos los índices reales, no ETFs proxy, para tener precios correctos:
+#   XAUUSD  → XAU/USD  (oro spot, forex)
+#   US30    → DJIA     (Dow Jones Industrial Average, índice)
+#   NAS100  → NDX      (Nasdaq 100, índice)
+# Twelve Data soporta DJIA y NDX en M15 con plan gratuito.
 TWELVE_DATA_SYMBOLS = {
-    "XAUUSD": {"symbol": "XAU/USD",  "tipo": "forex"},
-    "US30":   {"symbol": "DIA",      "tipo": "etf"},    # SPDR Dow Jones ETF (proxy US30)
-    "NAS100": {"symbol": "QQQ",      "tipo": "etf"},    # Invesco QQQ ETF (proxy NAS100)
+    "XAUUSD": {"symbol": "XAU/USD", "tipo": "forex"},
+    "US30":   {"symbol": "DJIA",    "tipo": "index"},   # Dow Jones índice real ~42,000
+    "NAS100": {"symbol": "NDX",     "tipo": "index"},   # Nasdaq 100 índice real ~19,000-20,000
 }
 
 
@@ -119,14 +123,13 @@ def obtener_candles_twelvedata(simbolo: str, tipo: str, dias: int = M15_DIAS) ->
         print(f"  ⚠️  TWELVE_DATA_API_KEY no configurada")
         return []
 
-    # Twelve Data usa outputsize para limitar cantidad de velas.
-    # Pedimos el máximo razonable para cubrir 7 días:
-    #   Forex: ~96 velas/día × 7 = 672 (pedimos 700 con margen)
-    #   ETFs:  ~26 velas/día × 7 = 182 (pedimos 200 con margen)
+    # outputsize por tipo:
+    #   forex (XAU/USD): opera 24h → ~96 velas/día × 7 = 672 → pedimos 700
+    #   index (DJIA, NDX): opera ~6.5h/día → ~26 velas/día × 7 = 182 → pedimos 200
     outputsize = 700 if tipo == 'forex' else 200
 
-    # Para ETFs/stocks el exchange es opcional pero evita ambigüedades
-    exchange_param = "&exchange=NASDAQ" if tipo == 'etf' else ""
+    # Los índices no necesitan exchange param; evitamos parámetros innecesarios
+    exchange_param = ""
 
     url = (
         f"https://api.twelvedata.com/time_series"
